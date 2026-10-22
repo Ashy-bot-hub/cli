@@ -85,6 +85,15 @@
     "spec_doc": "task_spec.md",
     "prompt": "工作目录 {root}。严格按 {spec} 的全部口径，生成 {day} 的报表。\n约束：\n1) 若输出文件已存在且含当日数据，直接结束并说明，禁止重复生成。\n2) 若缺源文件，直接结束并说明缺什么，禁止用推测值替代。\n3) 本机 PATH 可能没有 python，执行 Python 一律用绝对路径解释器。\n4) 结束时只用纯文本输出结论摘要，不生成额外的说明文件。\n回溯说明：{notes}"
   },
+  "scripts_sweep": {
+    "_说明": "跑完把本次任务新生成的临时脚本从 scripts/ 搬进 dir/<日期>/，脚本目录只留正式文件；keep 是白名单（额外保护你自己的脚本），永不被搬。purge_enabled 会自动删掉 dir 里超过 keep_days 的日期目录，只认严格 YYYY-MM-DD 命名的子目录，其它一律不碰。",
+    "enabled": true,
+    "dir": "_logs/_tmp",
+    "keep": [],
+    "purge_enabled": true,
+    "keep_days": 30,
+    "purge_interval_hours": 6
+  },
   "cli": {
     "node": "C:/Program Files/nodejs/node.exe",
     "entry": "C:/Program Files/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy",

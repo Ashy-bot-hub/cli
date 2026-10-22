@@ -785,6 +785,139 @@ _QUEUED = set()
 _MISS = {}
 
 
+# ---------------------------------------------------------------- 临时脚本收纳
+# CLI 跑任务时常常在 scripts 目录里现场写临时脚本（探测、生成、校验各一套），
+# 一天一套，几个月就把正经文件埋了。所以每次任务结束把「本次新增」的文件
+# 搬进 <log_dir>/_tmp/<日期>/ —— 只搬不删，复查还能翻到。
+_DEFAULT_SWEEP_KEEP = [
+    "watcher.py", "config.json", "config.example.json",
+    "start_watcher.vbs", "startup_watcher.vbs",
+]
+
+
+def _sweep_cfg():
+    c = CFG.get("scripts_sweep") or {}
+    keep = set(_DEFAULT_SWEEP_KEEP) | set(c.get("keep") or [])
+    return {
+        "enabled": bool(c.get("enabled", True)),
+        "dir": c.get("dir") or "_logs/_tmp",
+        "keep": keep,
+        "purge": bool(c.get("purge_enabled", True)),
+        "keep_days": int(c.get("keep_days", 30)),
+        "purge_hours": float(c.get("purge_interval_hours", 6)),
+    }
+
+
+def _rel_safe(p):
+    try:
+        return str(Path(p).relative_to(ROOT))
+    except Exception:
+        return str(p)
+
+
+def snapshot_scripts():
+    """任务开始前给 scripts 目录拍快照（只记文件名）；关闭时返回 None"""
+    if not _sweep_cfg()["enabled"]:
+        return None
+    try:
+        return {p.name for p in SCRIPT_DIR.iterdir() if p.is_file()}
+    except Exception as ex:
+        log(f"脚本快照失败（不影响任务）：{ex}")
+        return None
+
+
+def sweep_scripts(day: str, before):
+    """把本次任务新产生的文件收进 _tmp/<日期>/：只搬不删，白名单一律不动
+
+    只在任务**全部结束**后调用 —— 一次任务里可能先生成探测脚本、再生成、再校验，
+    中途搬走会让它自己找不到文件。
+    """
+    if before is None:
+        return 0
+    sc = _sweep_cfg()
+    if not sc["enabled"]:
+        return 0
+    try:
+        now = {p.name for p in SCRIPT_DIR.iterdir() if p.is_file()}
+    except Exception:
+        return 0
+    fresh = sorted(now - before - sc["keep"])
+    if not fresh:
+        return 0
+    dest = ROOT / sc["dir"] / day
+    moved = 0
+    for name in fresh:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(SCRIPT_DIR / name), str(dest / name))
+            moved += 1
+        except Exception as ex:
+            log(f"临时文件收纳失败 {name}｜{ex}")
+    if moved:
+        log(f"临时文件已收纳：{moved} 个 -> {_rel_safe(dest)}")
+    return moved
+
+
+# _tmp 下的日期目录名必须严格长这样，其它一律不碰（防止误删人工放进去的东西）
+_TMP_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def purge_tmp(force: bool = False) -> int:
+    """清理 _tmp 下超过 keep_days 的日期目录，让收纳不会无限堆积。
+
+    自动删除所以刻意保守：
+      - 只处理 _tmp 的**直接子目录**，名字必须严格是 YYYY-MM-DD，认不出一律跳过；
+      - 解析后再次校验路径正好在 _tmp 下一层，防配置写错指到别处；
+      - 只删早于 keep_days 天的，今天的和所有非日期目录不动；
+      - 全程 try/except，任何一步出错只记日志，不影响正在跑的任务；
+      - 用 .last_purge 时间戳节流，默认 6 小时最多清一次。
+    """
+    try:
+        sc = _sweep_cfg()
+        if not sc["purge"]:
+            return 0
+        base = ROOT / sc["dir"]
+        if not base.is_dir():
+            return 0
+        base_r = base.resolve()
+        stamp = base / ".last_purge"
+        if not force:
+            try:
+                if stamp.exists() and (time.time() - stamp.stat().st_mtime) < sc["purge_hours"] * 3600:
+                    return 0
+            except Exception:
+                pass
+        cutoff = datetime.now().date() - timedelta(days=max(1, sc["keep_days"]))
+        removed = 0
+        for d in list(base.iterdir()):
+            try:
+                if not d.is_dir() or not _TMP_NAME_RE.match(d.name):
+                    continue
+                try:
+                    dd = datetime.strptime(d.name, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if dd >= cutoff:
+                    continue
+                d_r = d.resolve()
+                if d_r.parent != base_r:
+                    log(f"临时文件清理跳过（路径异常）：{d}")
+                    continue
+                shutil.rmtree(d_r)
+                removed += 1
+                log(f"临时文件清理：移除 {d.name}（超过 {sc['keep_days']} 天）")
+            except Exception as ex:
+                log(f"临时文件清理跳过 {getattr(d, 'name', d)}｜{ex}")
+        try:
+            stamp.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+        except Exception:
+            pass
+        return removed
+    except Exception as ex:
+        log(f"临时文件清理异常（不影响任务）：{ex}")
+        return 0
+
+
 def _task_worker():
     """唯一的任务执行线程：从队列按入队顺序取，天然串行
 
@@ -793,6 +926,7 @@ def _task_worker():
     """
     while True:
         mode, day, payload = _RUN_QUEUE.get()
+        before = snapshot_scripts()
         try:
             if mode == "fix":
                 run_fix(payload)
@@ -803,6 +937,11 @@ def _task_worker():
         except Exception as e:
             log(f"任务异常 {day}｜{e}")
         finally:
+            try:
+                sweep_scripts(day, before)
+            except Exception as e:
+                log(f"临时文件收纳异常 {day}｜{e}")
+            purge_tmp()          # 内部自带节流与全量保底，出错只记日志
             _QUEUED.discard((mode, day))
             _RUN_QUEUE.task_done()
 
