@@ -13,6 +13,7 @@ file-watcher-automation-template
   - 补日场景会并发触发多天任务，必须按日期升序串行，否则同写一个输出文件会互相覆盖。
   - --output-format text 重定向到文件是全缓冲，长任务中途看不到任何输出，改用 stream-json。
   - 判定「同一天的两份文件谁更新」不能只比大小：改一个数字字节数常常完全一致。
+  - 「已产出就跳过」不等于一直对：源头改口径会让前面每一天都失效，见「报表周期与重算」。
 
 目录约定：
   <project>/scripts/watcher.py     ← 本文件
@@ -272,6 +273,12 @@ class Source:
         self.allow_newer = bool(spec.get("allow_newer_fallback", False))
         self.std_name = spec.get("std_name", "")  # 可选：如 "A_{m}-{d}.xlsx"
         self.date_source = spec.get("date_source") or default_date_source
+        # coverage：这份源「覆盖到哪天」。
+        #   "cumulative" = 周期累计堆叠表（某天那份里含周期首日到该日的全部区块，
+        #                  它一改，前面每一天都可能变）
+        #   "single"（默认）= 只含当天数据
+        # 修正版重算据此判断影响面，详见「报表周期与重算」一节。
+        self.coverage = (spec.get("coverage") or "single").lower()
 
     def matches(self, name: str) -> bool:
         return bool(self.pattern.match(strip_dup(name)))
@@ -779,25 +786,41 @@ _MISS = {}
 
 
 def _task_worker():
-    """唯一的任务执行线程：从队列按入队顺序取，天然串行"""
+    """唯一的任务执行线程：从队列按入队顺序取，天然串行
+
+    队列元素 (mode, day, payload)：normal=常规单日，recalc=周期末日整周期重算，
+    fix=修正版范围重算。三者可能同时排队，必须串行且升序，因为后一天依赖前一天。
+    """
     while True:
-        day = _RUN_QUEUE.get()
+        mode, day, payload = _RUN_QUEUE.get()
         try:
-            run_task(day)
+            if mode == "fix":
+                run_fix(payload)
+            elif mode == "recalc":
+                run_recalc(day)
+            else:
+                run_task(day)
         except Exception as e:
             log(f"任务异常 {day}｜{e}")
         finally:
-            _QUEUED.discard(day)
+            _QUEUED.discard((mode, day))
             _RUN_QUEUE.task_done()
 
 
-def enqueue_task(day: str) -> bool:
+def enqueue_task(day: str, mode: str = "normal", payload=None) -> bool:
     """入队（去重）。调用方按日期升序调用，队列保证按此顺序执行"""
-    if day in _QUEUED:
+    key = (mode, day)
+    if key in _QUEUED:
         return False
-    _QUEUED.add(day)
-    _RUN_QUEUE.put(day)
+    _QUEUED.add(key)
+    _RUN_QUEUE.put((mode, day, payload))
     return True
+
+
+def _is_queued(day: str, mode: str = None) -> bool:
+    if mode is not None:
+        return (mode, day) in _QUEUED
+    return any((m, day) in _QUEUED for m in ("normal", "recalc", "fix"))
 
 
 def run_task(day: str):
@@ -859,6 +882,392 @@ def run_task_serial(day: str):
         run_task(day)
     finally:
         _RUN_SERIAL.release()
+
+
+# ---------------------------------------------------------------- 报表周期与重算
+# 两种「产物已经出来、但结果是错的」的场景：
+#   1) 周期末日：业务方在周期最后一天重发源文件并改了口径（典型是单重/系数），
+#      本周期每一天的数字都变 → 必须整周期重算，只补末日那一天等于留一个月的错数。
+#   2) 任一日期被修正版替换：这份源到底改了哪几天，外部看不出来，只能按「源的覆盖范围」
+#      推定影响面 —— 累计堆叠型（coverage=cumulative）从周期首日算，单日型从被替换那天算，
+#      终点都取「当期最新已产出」，没出的日子交给常规流程。
+# 两个场景都依赖 produced_glob（否则无从判断产物到哪天为止），未配置则自动不启用。
+def _cycle_cfg():
+    c = CFG.get("cycle") or {}
+    return {
+        "enabled": bool(c.get("enabled")),
+        "start_day": int(c.get("start_day", 26)),
+        "end_day": int(c.get("end_day", 25)),
+        "recalc_on_end": bool(c.get("recalc_on_end", True)),
+        "timeout": float(c.get("timeout") or CFG.get("run_timeout", 5400)),
+    }
+
+
+def _shift_month(y, m, k):
+    idx = y * 12 + (m - 1) + k
+    return idx // 12, idx % 12 + 1
+
+
+def period_bounds(day: str):
+    """该日所属周期 (首日, 末日)。默认 26 日 ~ 次月 25 日"""
+    dt = datetime.fromisoformat(day).date()
+    sd, ed = _cycle_cfg()["start_day"], _cycle_cfg()["end_day"]
+    if dt.day >= sd:
+        y2, m2 = _shift_month(dt.year, dt.month, 1)
+        s, e = dt.replace(day=sd), dt.replace(year=y2, month=m2, day=ed)
+    else:
+        y0, m0 = _shift_month(dt.year, dt.month, -1)
+        s, e = dt.replace(year=y0, month=m0, day=sd), dt.replace(day=ed)
+    if e < s:
+        e = dt
+    return s, e
+
+
+def period_days(any_day: str):
+    """周期内全部日期，升序 ISO 字符串"""
+    s, e = period_bounds(any_day)
+    out, d = [], s
+    while d <= e:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def is_period_end(day: str) -> bool:
+    c = _cycle_cfg()
+    return c["enabled"] and int(day.split("-")[2]) == c["end_day"]
+
+
+def latest_output_day(day: str):
+    """当期已产出产物的最晚日期；查不到返回 None"""
+    today = datetime.now().date().isoformat()
+    for d in reversed(period_days(day)):
+        if d > today:
+            continue
+        if has_produced(d):
+            return d
+    return None
+
+
+def _day_action(day: str, done_dir: Path):
+    """返回 (action, reason)。action: skip / recalc / normal
+
+    周期末日即使已有产物、已有完成标记，只要没有 recalc 标记就必须重算 ——
+    那一天源文件里改的口径会让全周期数字都失效，不能按「已产出」跳过。
+    """
+    c = _cycle_cfg()
+    if c["enabled"] and c["recalc_on_end"] and is_period_end(day):
+        if (done_dir / f"recalc-{day}.ok").exists():
+            return "skip", "整周期重算已完成"
+        return "recalc", "周期末日需整周期重算"
+    if (done_dir / f"{day}.ok").exists():
+        return "skip", "已完成"
+    if has_produced(day):
+        return "skip", "已有产物"
+    return "normal", ""
+
+
+def _scope_addendum(start: str, end: str, full: bool, why: str) -> str:
+    """追加到用户配置的 prompt 之后。模板不知道你的产物长什么样（一文件多 sheet、
+    一天一文件都可能），所以这里只写与结构无关的硬要求。"""
+    s, e = period_bounds(end)
+    n = len([d for d in period_days(end) if start <= d <= end])
+    prev = (datetime.fromisoformat(start).date() - timedelta(days=1))
+    base = ("" if full else
+            f"；{start} 不是周期首日，它的累计基数取上一日（{prev.month}.{prev.day}）的现值，"
+            f"那一日不在本次范围内，只读不改")
+    return (
+        f"\n\n【本轮是范围重算，不是常规单日出报】\n"
+        f"报表周期：{s.isoformat()} 至 {e.isoformat()}。\n"
+        f"本次重算范围：{start} 至 {end}，共 {n} 天"
+        + ("（本周期全部日期）" if full else "") + "。\n"
+        f"原因：{why}\n"
+        f"要求：\n"
+        f"1) 按日期**升序**逐日重算，每天的数字都要回到源文件重新取，"
+        f"**禁止沿用产物里的旧值**。\n"
+        f"2) 范围外的日期一律不动（{start} 之前、{end} 之后都不碰）。\n"
+        f"3) 累计/结转类数字必须引用刚重算过的上一日，不得引用旧快照{base}。\n"
+        f"4) 源文件缺失的日期：保留原值并在摘要中逐日列出，禁止用推测值或邻日值替代。\n"
+        f"5) 自检：区间末日的累计值应等于逐日数值之和；出现倒退或断档如实报告，不要硬凑。\n"
+        f"6) 结束时用纯文本输出：重算了哪些日期、区间末日的累计值、与重算前相比变化多少、"
+        f"缺源的日期清单。不生成额外文件。"
+    )
+
+
+def run_scope_task(start: str, end: str, full: bool, why: str, tag: str, timeout: float):
+    """按范围重算 [start, end]。tag 同时用作完成标记、锁、日志与结论文件名。"""
+    done = TRIGGER / "_done" / f"{tag}.ok"
+    lock = TRIGGER / "_running" / f"{tag}.lock"
+    done.parent.mkdir(parents=True, exist_ok=True)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+
+    if done.exists():
+        log(f"跳过重算：{tag} 已完成")
+        return
+    if lock.exists():
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age > timeout + 300:
+            log(f"清理陈旧重算锁：{tag}（残留 {age / 60:.0f} 分钟，判定为上次异常退出）")
+            lock.unlink(missing_ok=True)
+        else:
+            log(f"跳过重算：{tag} 正在执行中")
+            return
+
+    out_log = LOGDIR / f"{tag}.log"
+    lock.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    t0 = time.time()
+    try:
+        log(f"开始范围重算：{tag}｜{start}~{end}"
+            + ("（全周期）" if full else "") + f"｜输出 {out_log.name}")
+        notify("开始范围重算", f"{tag}：{start} 至 {end}")
+        prompt = build_prompt(end) + _scope_addendum(start, end, full, why)
+        r = _run_cli_retry(prompt, out_log, timeout, tag, extra_args=_perm_args())
+        elapsed = time.time() - t0
+        save_conclusion(tag, r, elapsed, out_log)
+        if r.returncode == 0:
+            done.write_text(json.dumps(
+                {"tag": tag, "scope": [start, end], "full": bool(full),
+                 "at": datetime.now().isoformat(timespec="seconds"),
+                 "elapsed_seconds": round(elapsed, 1), "exit": 0},
+                ensure_ascii=False), encoding="utf-8")
+            log(f"范围重算完成：{tag}（exit 0，{elapsed / 60:.1f} 分钟）")
+            notify("范围重算完成", f"{tag}：{start} 至 {end}，见 {CONC_DIR.name}/{tag}.md")
+        else:
+            log(f"范围重算失败：{tag}（exit {r.returncode}）｜详见 {out_log.name}")
+            notify("范围重算失败", f"{tag} exit {r.returncode}")
+    except Exception as e:
+        log(f"范围重算异常：{tag}｜{e}")
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+# ---- 修正版重算：源文件被替换 → 按影响面重算一段区间
+FIX_PENDING = TRIGGER / "_fix_pending.json"
+FIX_STATE = TRIGGER / "_fix_state.json"
+SRC_SNAP = TRIGGER / "_source_fps.json"
+
+
+def _fix_cfg():
+    c = CFG.get("fix_recalc") or {}
+    return {
+        "enabled": bool(c.get("enabled", True)),
+        "cumulative_full_period": bool(c.get("cumulative_full_period", True)),
+        "quiet_minutes": float(c.get("quiet_minutes", 10)),
+        "max_per_day": int(c.get("max_per_day", 3)),
+        "allow_closed_period": bool(c.get("allow_closed_period", False)),
+        "timeout": float(c.get("timeout") or CFG.get("run_timeout", 5400)),
+    }
+
+
+def _read_json(p: Path, default):
+    try:
+        return json.loads(Path(p).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _write_json(p: Path, obj):
+    try:
+        Path(p).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"写 {Path(p).name} 失败：{e}")
+
+
+def _coverage_of(name: str) -> str:
+    for s in SOURCES:
+        if s.name == name:
+            return s.coverage
+    return "single"
+
+
+def _source_fps():
+    """各「源+日期」的版本指纹，只 stat 不读内容，只扫补日窗口内的日期"""
+    look = max(1, int(CFG.get("lookback_days", 7)))
+    today = datetime.now().date()
+    window = {(today - timedelta(days=i)).isoformat() for i in range(look)}
+    out = {}
+    for s in SOURCES:
+        for d, f in s.list_all():
+            ds = d.isoformat()
+            if ds not in window:
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            out[f"{s.name}|{ds}"] = {"fp": f"{st.st_size}:{int(st.st_mtime)}", "path": str(f)}
+    return out
+
+
+def note_fix_event(category: str, day: str, dst, why: str = ""):
+    """登记一次「源文件被新版替换」。先进待办，静默期过后再收 —— 对方连发两版只跑最后那版。"""
+    fc = _fix_cfg()
+    if not fc["enabled"] or not category or not day:
+        return
+    if is_period_end(day) and _cycle_cfg()["recalc_on_end"]:
+        log(f"修正版并入整周期重算：{category} {day}")
+        return
+    if not has_produced(day):
+        log(f"修正版忽略：{category} {day} 尚未产出，常规流程会用最新源")
+        return
+    try:
+        st = Path(dst).stat()
+        fp = f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        return
+    pend = _read_json(FIX_PENDING, {})
+    key = f"{category}|{day}"
+    now = time.time()
+    it = pend.get(key) or {"category": category, "day": day,
+                           "first_seen": now, "versions": 0}
+    it.update({"dst": str(dst), "fp": fp, "last_seen": now,
+               "versions": int(it.get("versions", 0)) + 1})
+    pend[key] = it
+    _write_json(FIX_PENDING, pend)
+    log(f"登记修正版：{category} {day}｜第 {it['versions']} 版｜"
+        f"静默 {fc['quiet_minutes']:.0f} 分钟无新版本后重算" + (f"｜{why}" if why else ""))
+
+
+def watch_source_changes():
+    """扫一遍源文件版本，和上次快照比：某「源+日期」变过且该日已产出 → 登记修正版重算。
+
+    走快照对比而不是只挂在「外部取件」这一步，是因为使用者也可能直接覆盖源目录里的
+    文件（或手工另存），那条路径不经过 adopt()，只在取件处挂钩会漏。
+    """
+    cur = _source_fps()
+    snap = _read_json(SRC_SNAP, {})
+    for key, info in cur.items():
+        old = (snap.get(key) or {}).get("fp")
+        if old and old != info["fp"]:
+            name, day = key.split("|", 1)
+            note_fix_event(name, day, Path(info["path"]), "源文件版本变化")
+    _write_json(SRC_SNAP, cur)
+
+
+def fix_scope(category: str, day: str):
+    """这份修正版影响到哪些日期。返回 (scope, reason)，scope=(start, end, full)"""
+    fc = _fix_cfg()
+    s, e = period_bounds(day)
+    if is_period_end(day) and _cycle_cfg()["recalc_on_end"]:
+        return None, "周期末日归整周期重算统一处理"
+    if e < datetime.now().date() and not fc["allow_closed_period"]:
+        return None, (f"该日所属周期（{s.isoformat()}~{e.isoformat()}）已结束，"
+                      f"不自动重算历史周期，请人工确认")
+    if not has_produced(day):
+        return None, "该日尚未产出，常规流程会用最新源，无需补算"
+    latest = latest_output_day(day)
+    if not latest:
+        return None, "当期查不到已产出的产物（produced_glob 未配置或尚未产出）"
+    if day > latest:
+        return None, f"该日（{day}）晚于当期最新产物（{latest}）"
+    full = (_coverage_of(category) == "cumulative" and fc["cumulative_full_period"])
+    start = s.isoformat() if full else day
+    if start > latest:
+        return None, "区间起点晚于最新产物"
+    return (start, latest, full), ""
+
+
+def _fix_runs_today(key: str) -> int:
+    st = _read_json(FIX_STATE, {})
+    today = datetime.now().date().isoformat()
+    return sum(1 for x in ((st.get(key) or {}).get("runs") or [])
+               if str(x.get("at", "")).startswith(today))
+
+
+def _mark_fix(key: str, fp: str, scope=None, fail=False):
+    st = _read_json(FIX_STATE, {})
+    it = st.setdefault(key, {})
+    if not fail and scope:
+        it["fp"] = fp
+        it["scope"] = list(scope)
+    it["applied_at"] = datetime.now().isoformat(timespec="seconds")
+    runs = it.get("runs") or []
+    runs.append({"fp": fp, "at": it["applied_at"], "fail": bool(fail)})
+    it["runs"] = runs[-20:]
+    _write_json(FIX_STATE, st)
+
+
+def collect_ready_fixes():
+    """收取可以跑的修正版重算：静默期已过、版本没跑过、次数没超、区间有效。"""
+    fc = _fix_cfg()
+    if not fc["enabled"]:
+        return []
+    pend = _read_json(FIX_PENDING, {})
+    if not pend:
+        return []
+    st = _read_json(FIX_STATE, {})
+    now, out, dirty = time.time(), [], False
+    for key in list(pend):
+        it = pend.get(key) or {}
+        cat, day = it.get("category"), it.get("day")
+        if not cat or not day:
+            pend.pop(key, None)
+            dirty = True
+            continue
+        fp = str(it.get("fp") or "")
+        if fp and (st.get(key) or {}).get("fp") == fp:
+            pend.pop(key, None)
+            dirty = True
+            log(f"修正版待办作废：{cat} {day} 该版本已重算过")
+            continue
+        if now - float(it.get("last_seen") or 0) < fc["quiet_minutes"] * 60:
+            continue
+        scope, why = fix_scope(cat, day)
+        if not scope:
+            pend.pop(key, None)
+            dirty = True
+            log(f"修正版待办作废：{cat} {day}｜{why}")
+            continue
+        n = _fix_runs_today(key)
+        if n >= fc["max_per_day"]:
+            pend.pop(key, None)
+            dirty = True
+            log(f"修正版待办作废：{cat} {day} 今日已重算 {n} 次，达上限 {fc['max_per_day']}")
+            notify("修正版已达次数上限", f"{cat} {day} 今日已重算 {n} 次，请人工确认")
+            continue
+        start, end, full = scope
+        out.append({"start": start, "end": end, "full": full, "why": why,
+                    "tag": f"fix-{day}-{cat}-{fp.replace(':', '-')}",
+                    "key": key, "day": day, "cat": cat, "fp": fp})
+        pend.pop(key, None)
+        dirty = True
+    if dirty:
+        _write_json(FIX_PENDING, pend)
+    return sorted(out, key=lambda x: (x["day"], x["cat"]))
+
+
+def run_fix(fx: dict):
+    """跑一次修正版重算，成功/失败都记次数（失败也记，避免坏任务无限重试）"""
+    tag, key, fp = fx["tag"], fx["key"], fx["fp"]
+    try:
+        run_scope_task(fx["start"], fx["end"], fx["full"], fx["why"], tag,
+                       _fix_cfg()["timeout"])
+        ok = (TRIGGER / "_done" / f"{tag}.ok").exists()
+        _mark_fix(key, fp, [fx["start"], fx["end"]], fail=not ok)
+        if not ok:
+            pend = _read_json(FIX_PENDING, {})
+            pend[key] = {"category": fx["cat"], "day": fx["day"],
+                         "dst": "", "fp": fp,
+                         "first_seen": time.time(), "last_seen": time.time(),
+                         "versions": 1}
+            _write_json(FIX_PENDING, pend)
+            log(f"修正版重算未成功：{tag}，已重新登记待下次静默期后重试")
+    except Exception as e:
+        log(f"修正版重算异常：{tag}｜{e}")
+
+
+def run_recalc(end_day: str):
+    """周期末日整周期重算"""
+    s, e = period_bounds(end_day)
+    start = s.isoformat()
+    why = (f"业务方在周期末日重发的源文件里改了口径（常见是单重/系数），"
+           f"由「数量 × 系数」算出的数在**本周期每一天**都变了；"
+           f"累计列是链式的，某天变了之后每一天都得跟着变。")
+    run_scope_task(start, e.isoformat(), True, why, f"recalc-{end_day}",
+                   _cycle_cfg()["timeout"])
 
 
 # ---------------------------------------------------------------- 单实例
@@ -932,6 +1341,24 @@ def main():
                     except Exception as e:
                         log(f"外部取件异常 {c['name']}：{e}")
 
+                # 源文件版本巡检：某「源+日期」被新版替换且该日已出产物 → 登记修正版重算
+                try:
+                    watch_source_changes()
+                except Exception as e:
+                    log(f"源版本巡检异常：{e}")
+
+                # 修正版重算排在「齐备检查」之前入队：先把旧日期修正，再出新日期的产物，
+                # 否则新产物会踩着尚未修正的上一日累计值算。
+                for fx in collect_ready_fixes():
+                    if _is_queued(fx["day"], "fix"):
+                        continue
+                    desc = f"{fx['cat']} {fx['day']} 修正版｜重算 {fx['start']}~{fx['end']}"
+                    if CFG.get("auto_run"):
+                        if enqueue_task(fx["day"], "fix", fx):
+                            log(f"已入队修正版重算：{desc}（队列待执行 {_RUN_QUEUE.qsize()}）")
+                    else:
+                        notify("源文件出现修正版", desc + "（auto_run=false，需人工触发）")
+
                 # 齐备检查：最近 N 天内、尚未出产物、尚未开跑的日期。
                 # 源文件到位时间不固定（可能今天才到前天的、也可能今天的明天才到），
                 # 所以窗口由 lookback_days 决定；已出过产物的一律跳过，绝不动已有结果。
@@ -940,24 +1367,31 @@ def main():
                 days = [(today - timedelta(days=i)).isoformat() for i in range(look)]
                 done_dir = TRIGGER / "_done"
                 for day in sorted(days):
-                    if day in _QUEUED:
+                    if _is_queued(day):
                         continue
-                    if (done_dir / f"{day}.ok").exists():
-                        continue
-                    if has_produced(day):
+                    action, reason = _day_action(day, done_dir)
+                    if action == "skip":
                         if day not in warned:
                             warned.add(day)
-                            log(f"{day} 已有产物，跳过（不重算）")
+                            log(f"{day} {reason}，跳过（被新版替换的情况走修正版重算）")
                         continue
                     ok, missing, rp = check_ready(day)
                     if ok:
                         _MISS.pop(day, None)
                         if day not in warned:
                             warned.add(day)
-                            log(f"源文件齐备（{day}），标记 {rp.name}")
+                            if action == "recalc":
+                                s0, e0 = period_bounds(day)
+                                log(f"源文件齐备（{day}，周期末日）｜"
+                                    f"{s0.isoformat()}~{e0.isoformat()} 共 "
+                                    f"{len(period_days(day))} 天，将整周期重算")
+                            else:
+                                log(f"源文件齐备（{day}），标记 {rp.name}")
                             if CFG.get("auto_run"):
-                                if enqueue_task(day):
-                                    log(f"已入队：{day}（队列待执行 {_RUN_QUEUE.qsize()}）")
+                                if enqueue_task(day, action):
+                                    log(f"已入队：{day}"
+                                        f"（{'整周期重算' if action == 'recalc' else '常规'}，"
+                                        f"队列待执行 {_RUN_QUEUE.qsize()}）")
                             else:
                                 notify("源文件已齐备",
                                        f"{day} 可执行任务（auto_run=false，需人工触发）")

@@ -15,19 +15,41 @@
   "auto_run": true,
   "preflight_on_start": true,
   "run_timeout": 5400,
+  "cycle": {
+    "_注": "报表周期与末日整周期重算。enabled=false 则完全关闭本功能（回到「只出当天」的旧行为）。两个重算功能都依赖 produced_glob 判断产物到哪天为止。",
+    "enabled": false,
+    "start_day": 26,
+    "end_day": 25,
+    "recalc_on_end": true,
+    "timeout": 10800,
+    "_recalc_on_end 说明": "周期末日那天，业务方常在重发的源文件里改口径（如单重/系数），本周期每一天的数字都变，只补末日那天等于留一个月错数。true = 该日以「整周期重算」代替常规单日出报。"
+  },
+  "fix_recalc": {
+    "_注": "任一日期的源文件被新版替换（该日已出过产物）时，按影响面重算一段日期，避免手工再跑一遍。",
+    "enabled": true,
+    "cumulative_full_period": true,
+    "quiet_minutes": 10,
+    "max_per_day": 3,
+    "allow_closed_period": false,
+    "timeout": 10800,
+    "_参数说明": "cumulative_full_period=累计堆叠型源（sources 里 coverage=cumulative）被替换时从周期首日重算，关闭则只从被替换那天起算。quiet_minutes=静默期，对方连发两版只跑最后那版。max_per_day=同一「源+日期」每天最多自动重算几次，超出只提醒。allow_closed_period=周期已结束后是否还自动重算历史周期（默认 false，只提醒人工）。"
+  },
   "sources": [
     {
       "name": "生产日报",
       "dir": "source_a",
       "pattern": "^生产日报_(?P<m>\\d{1,2})[.-](?P<d>\\d{1,2})\\.xlsx$",
-      "std_name": "生产日报_{m}.{d}.xlsx"
+      "std_name": "生产日报_{m}.{d}.xlsx",
+      "coverage": "single"
     },
     {
       "name": "出入库",
       "dir": "source_b",
       "pattern": "^出入库_(?P<y>\\d{4})年(?P<m>\\d{1,2})月(?P<d>\\d{1,2})日\\.xlsx$",
       "std_name": "出入库_{y}年{m}月{d}日.xlsx",
-      "allow_newer_fallback": true
+      "allow_newer_fallback": true,
+      "coverage": "cumulative",
+      "_coverage 说明": "cumulative = 周期累计堆叠表（某天那份里含周期首日到该日的全部区块，改一处则前面每天都可能变）。修正版重算据此决定从周期首日算还是从当天算。"
     },
     {
       "_注": "文件名不含日期的场景：date_source 设 mtime，正则只判断类型",
