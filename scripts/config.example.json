@@ -94,6 +94,14 @@
     "keep_days": 30,
     "purge_interval_hours": 6
   },
+  "watchdog": {
+    "_说明": "守护进程 watchdog.pyw 的参数。watcher.py 每轮轮询更新 _trigger/_heartbeat（节流60秒），守护按 interval_seconds 检查其 mtime：超过 stale_seconds 且 lock 里的 pid 已不存在才拉起。pid 存活但心跳超时只记警告、不自动杀（它可能在跑几小时的长任务），连续 stall_warn_rounds 轮才升级措辞。拉起失败按指数退避，上限 max_backoff_seconds。enabled=false 可整体关闭。",
+    "enabled": true,
+    "interval_seconds": 300,
+    "stale_seconds": 900,
+    "max_backoff_seconds": 1800,
+    "stall_warn_rounds": 3
+  },
   "cli": {
     "node": "C:/Program Files/nodejs/node.exe",
     "entry": "C:/Program Files/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy",

@@ -78,8 +78,9 @@ python scripts/watcher.py --pickup
 <project>/
 ├─ scripts/
 │  ├─ watcher.py                 # 主体
+│  ├─ watchdog.pyw               # 守护：看心跳，崩溃后拉起主体
 │  ├─ config.json                # 你的配置（由 config.example.json 复制）
-│  ├─ start_watcher.vbs          # 无窗口启动
+│  ├─ start_watcher.vbs          # 无窗口启动（启动的是 watchdog.pyw）
 │  └─ startup_watcher.vbs        # 开机自启版（放「启动」文件夹）
 ├─ source_a/                     # 源 1
 ├─ source_b/                     # 源 2
@@ -270,6 +271,32 @@ CLI 每次执行任务，都习惯在 `scripts/` 里现场写一批脚本：探�
 
 ---
 
+## 进程崩了没人知道（`watchdog.pyw`）
+
+无人值守最怕的不是报错，是**静默失效**。`pythonw` 退出是无声的：没有窗口、没有弹窗、没有提示音，日志就停在最后一行。源文件照常在往目录里落，但没人处理。开机自启只在登录时跑一次，所以崩了要等到下次重启才恢复——中间那几天全是空白，而你不会发现，因为它看起来「什么都没干」和「在等文件」长得一模一样。
+
+`watchdog.pyw` 就是补这一段：
+
+- `watcher.py` 每轮轮询更新 `_trigger/_heartbeat`（节流 60 秒写一次，不是每轮写盘）
+- 守护每 `interval_seconds` 看一眼它的 mtime——**不只看 pid**。pid 会被系统复用，心跳不会说谎；而且心跳能顺带发现「进程还在但已经卡死」这类比崩溃更隐蔽的情况
+- 心跳超过 `stale_seconds` 且 lock 里的 pid 确实不在了 → 拉起
+
+**只拉起，绝不杀进程。** 这一条是刻意的：它可能正在跑几小时的整周期重算，误杀一次的代价远大于多等几分钟。所以 pid 存活但心跳不动时，只累计警告，连续 `stall_warn_rounds` 轮才在日志里升级措辞，仍然不杀——那种情况需要人来看。
+
+拉起失败按指数退避（`interval × 2ⁿ`），封顶 `max_backoff_seconds`，避免守护和主程序互相拖进疯狂重启。守护自身也有单实例保护，重复启动会自己退出。
+
+部署时注意：`start_watcher.vbs` 和 `startup_watcher.vbs` 都要指向 `watchdog.pyw`，**不要指向 `watcher.py`**。指错了就等于守护永远不在，整套自愈能力等于没装。
+
+| 字段 | 说明 |
+| --- | --- |
+| `enabled` | 守护总开关，`false` 则守护启动后立即退出 |
+| `interval_seconds` | 多久检查一次，默认 300 |
+| `stale_seconds` | 心跳多久没更新算失效，默认 900（15 分钟） |
+| `max_backoff_seconds` | 拉起失败的退避上限，默认 1800 |
+| `stall_warn_rounds` | 连续多少轮「进程在但没心跳」升级为严重日志，默认 3 |
+
+---
+
 ## WorkBuddy CLI 无人值守的六个坑（本项目的核心内容）
 
 这些都是实际调试出来的，不是文档抄来的。抄代码时**不要改回裸调用**。
@@ -398,6 +425,11 @@ CLI 的 bash 环境 **PATH 与你自己的终端不同**（你的终端有 pytho
 - 第四版：
   1. `scripts_sweep`：任务结束后把本次新生成的临时脚本搬进 `<log_dir>/_tmp/<日期>/`，`scripts/` 只留正式文件；白名单保护本体与配置。
   2. `purge_tmp`：自动删除 `_tmp` 下超过 `keep_days` 的日期目录，只认严格 `YYYY-MM-DD`、二次校验路径、出错只记日志、6 小时节流。
+- 第五版：
+  1. `watchdog.pyw` 进程守护：主程序写 `_trigger/_heartbeat`（节流 60 秒），守护看 mtime 判断——比看 pid 可靠，还能发现「进程在但卡死」。
+  2. **只拉起不杀**：pid 存活但心跳不动只累计警告，连续多轮才升级措辞，绝不自动杀（它可能在跑长任务）。
+  3. 拉起失败指数退避封顶，守护自身单实例。
+  4. 两个 `.vbs` 改为指向 `watchdog.pyw`；指错成 `watcher.py` 等于自愈能力没装。
 
 ---
 

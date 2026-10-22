@@ -112,12 +112,42 @@ LOGDIR = ROOT / CFG["log_dir"]
 TRIGGER = ROOT / CFG["trigger_dir"]
 CONC_DIR = ROOT / CFG.get("conclusion_dir", "conclusions")
 STREAM_DIR = LOGDIR / "_stream"
+HEARTBEAT = TRIGGER / "_heartbeat"   # 心跳文件，守护进程（watchdog.pyw）据此判断本进程是否还活着
 for d in (LOGDIR, TRIGGER, CONC_DIR, STREAM_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 IGNORE_PREFIX = ("~$", "._", ".")
 # 判定「谁更新」时容许的 mtime 误差，避免复制动作本身带来的毫秒级抖动误判
 MTIME_TOL = 2.0
+
+
+# ---------------------------------------------------------------- 心跳
+_last_beat = 0.0
+
+
+def _beat(force: bool = False):
+    """写心跳，供守护进程判断本进程是否还活着。
+
+    为什么需要：无人值守场景下进程崩溃是无声的 —— 没有窗口、没有弹窗，
+    日志停在最后一行，源文件照常往目录里落，但没人处理，要等下次重启
+    才恢复。心跳 + 外部守护是唯一能覆盖这种情况的办法。
+
+    节流到 60 秒一次：主循环轮询比这快得多，每轮写盘既没必要也不利于追溯。
+    写盘失败一律吞掉 —— 监控自身绝不能影响主流程。
+    """
+    global _last_beat
+    now = time.time()
+    if not force and now - _last_beat < 60:
+        return
+    _last_beat = now
+    try:
+        HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT.write_text(
+            f"{os.getpid()}\n{datetime.now().isoformat(timespec='seconds')}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------- 工具
@@ -790,7 +820,7 @@ _MISS = {}
 # 一天一套，几个月就把正经文件埋了。所以每次任务结束把「本次新增」的文件
 # 搬进 <log_dir>/_tmp/<日期>/ —— 只搬不删，复查还能翻到。
 _DEFAULT_SWEEP_KEEP = [
-    "watcher.py", "config.json", "config.example.json",
+    "watcher.py", "watchdog.pyw", "config.json", "config.example.json",
     "start_watcher.vbs", "startup_watcher.vbs",
 ]
 
@@ -1449,6 +1479,7 @@ def main():
         log("未配置任何 sources，退出")
         return
     log(f"启动｜根目录 {ROOT}｜源 {[s.name for s in SOURCES]}｜轮询 {CFG['poll_seconds']}s｜pid {os.getpid()}")
+    _beat(force=True)
 
     today = datetime.now().date().isoformat()
     mark = TRIGGER / "_preflight" / f"{today}.ok"
@@ -1470,6 +1501,7 @@ def main():
     try:
         while True:
             try:
+                _beat()
                 # 外部来源取件：文件先落在下载目录/聊天软件目录时，靠这一步认领
                 for c in ext:
                     if time.time() < ext_next[c["name"]]:

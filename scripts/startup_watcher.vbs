@@ -17,6 +17,9 @@
 '      file breaks the launcher silently.
 '
 ' Hardened behaviour:
+'   - launches watchdog.pyw (NOT watcher.py): the watchdog starts watcher.py and
+'     relaunches it within minutes if it dies. Launching watcher.py directly
+'     here would mean a silent crash stays unnoticed until the next logon.
 '   - falls back to python.exe when pythonw.exe is missing
 '   - retries 12 x 10s for the target file (cold boot can be slow)
 '   - appends a timestamped line to <project>\_logs\startup.log on success,
@@ -30,7 +33,7 @@ errfile = base & "\startup_error.txt"
 
 pyw = "C:\Users\Administrator\.workbuddy\binaries\python\versions\3.14.3\pythonw.exe"
 pyn = "C:\Users\Administrator\.workbuddy\binaries\python\versions\3.14.3\python.exe"
-target = "C:\path\to\project\scripts\watcher.py"
+target = "C:\path\to\project\scripts\watchdog.pyw"
 
 If fso.FileExists(pyw) Then
     py = pyw
@@ -48,7 +51,7 @@ For i = 1 To 12
     End If
     WScript.Sleep 10000
 Next
-If Not ready Then WriteErr "E3 watcher.py not found: " & target
+If Not ready Then WriteErr "E3 watchdog.pyw not found: " & target
 
 runerr = ""
 On Error Resume Next
