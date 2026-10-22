@@ -13,33 +13,68 @@
 '          python tools\gen_chrw_path.py "D:\your project\scripts\watcher.py"
 '      and paste the produced  "..." & ChrW(...)  expression as the value of
 '      target. That keeps this file ASCII-only.
+'      NOTE: this applies to comments too. Any non-ASCII byte anywhere in this
+'      file breaks the launcher silently.
 '
-' On failure a startup_error.txt is written next to this file.
+' Hardened behaviour:
+'   - falls back to python.exe when pythonw.exe is missing
+'   - retries 12 x 10s for the target file (cold boot can be slow)
+'   - appends a timestamped line to <project>\_logs\startup.log on success,
+'     which is the only reliable proof that the boot start really fired
+'     (change TRACE_DIR below if you use a different log_dir)
+'   - deletes a stale error file after a good start
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
 base = fso.GetParentFolderName(WScript.ScriptFullName)
 errfile = base & "\startup_error.txt"
 
-py = "C:\Users\Administrator\.workbuddy\binaries\python\versions\3.14.3\pythonw.exe"
+pyw = "C:\Users\Administrator\.workbuddy\binaries\python\versions\3.14.3\pythonw.exe"
+pyn = "C:\Users\Administrator\.workbuddy\binaries\python\versions\3.14.3\python.exe"
 target = "C:\path\to\project\scripts\watcher.py"
 
-If Not fso.FileExists(py) Then
-    Set ef = fso.CreateTextFile(errfile, True)
-    ef.Write "E2 pythonw.exe not found: " & py
-    ef.Close
-    WScript.Quit 2
+If fso.FileExists(pyw) Then
+    py = pyw
+ElseIf fso.FileExists(pyn) Then
+    py = pyn
+Else
+    WriteErr "E2 no python interpreter: " & pyw
 End If
-If Not fso.FileExists(target) Then
-    Set ef = fso.CreateTextFile(errfile, True)
-    ef.Write "E3 watcher.py not found: " & target
-    ef.Close
-    WScript.Quit 3
-End If
+
+ready = False
+For i = 1 To 12
+    If fso.FileExists(target) Then
+        ready = True
+        Exit For
+    End If
+    WScript.Sleep 10000
+Next
+If Not ready Then WriteErr "E3 watcher.py not found: " & target
+
+runerr = ""
 On Error Resume Next
 sh.Run """" & py & """ """ & target & """", 0, False
-If Err.Number <> 0 Then
-    Set ef = fso.CreateTextFile(errfile, True)
-    ef.Write "E9 run failed: " & Err.Description
-    ef.Close
-    WScript.Quit 9
-End If
+If Err.Number <> 0 Then runerr = "E9 run failed: " & Err.Description
+Err.Clear
+On Error GoTo 0
+If runerr <> "" Then WriteErr runerr
+
+' ---- success: drop stale error, then leave a trace
+On Error Resume Next
+If fso.FileExists(errfile) Then fso.DeleteFile errfile, True
+projroot = fso.GetParentFolderName(fso.GetParentFolderName(target))
+tracedir = projroot & "\_logs"
+If Not fso.FolderExists(tracedir) Then fso.CreateFolder tracedir
+ts = Year(Now) & "-" & Right("0" & Month(Now), 2) & "-" & Right("0" & Day(Now), 2) & " " & _
+     Right("0" & Hour(Now), 2) & ":" & Right("0" & Minute(Now), 2) & ":" & Right("0" & Second(Now), 2)
+Set tf = fso.OpenTextFile(tracedir & "\startup.log", 8, True, -1)
+tf.WriteLine ts & "  startup fired | python=" & py & " | target=" & target
+tf.Close
+
+Sub WriteErr(msg)
+    Dim f
+    On Error Resume Next
+    Set f = fso.CreateTextFile(errfile, True, -1)
+    f.Write msg
+    f.Close
+    WScript.Quit 2
+End Sub

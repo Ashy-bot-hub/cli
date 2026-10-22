@@ -2,10 +2,16 @@
   "_说明": "复制为 config.json 后按自己的任务改。文件名正则用命名分组 y/m/d 取日期，缺 y 时按当年。",
   "log_dir": "_logs",
   "trigger_dir": "_trigger",
+  "conclusion_dir": "conclusions",
   "date_source": "filename",
   "poll_seconds": 5,
   "stable_seconds": 3,
-  "lookback_days": 1,
+  "lookback_days": 7,
+  "_lookback_days 说明": "补日窗口：往前追几天。源文件到位时间不固定时调大；已出过产物或已跑过的日期会跳过，不会重算历史。",
+  "wait_log_interval_seconds": 1800,
+  "_wait_log 说明": "缺件等待日志的心跳间隔。整天没文件时，靠它证明监听还活着（否则日志一片空白，分不清守着还是挂了）。",
+  "produced_glob": "output/报表{y}.{m}.{d}*.xlsx",
+  "_produced_glob 说明": "产物判定：该日期已有匹配文件就永不重跑。{y}{m}{d} 不补零。留空则关闭此判定（放宽窗口时强烈建议配置，否则会重算历史）。",
   "auto_run": true,
   "preflight_on_start": true,
   "run_timeout": 5400,
@@ -31,6 +37,28 @@
       "date_source": "mtime"
     }
   ],
+  "external_sources": [
+    {
+      "_注": "文件先落在别处（浏览器下载目录、微信/企业微信的文件目录）时，靠这里认领，复制进 sources 的目录，绝不移动或删除原件。不用就删掉本数组。",
+      "name": "下载目录",
+      "enabled": false,
+      "root": "C:/Users/你的用户名/Downloads",
+      "depth": 4,
+      "max_age_days": 8,
+      "interval_seconds": 30,
+      "sources": []
+    },
+    {
+      "_注": "微信 4.x 的路径形如 <root>\\<wxid_*>\\msg\\file\\YYYY-MM\\，需要 depth>=4；sources 留空表示匹配全部源",
+      "name": "微信文件",
+      "enabled": false,
+      "root": "D:/Backup/Documents/xwechat_files",
+      "depth": 5,
+      "max_age_days": 8,
+      "interval_seconds": 30,
+      "sources": ["生产日报", "出入库"]
+    }
+  ],
   "task": {
     "spec_doc": "task_spec.md",
     "prompt": "工作目录 {root}。严格按 {spec} 的全部口径，生成 {day} 的报表。\n约束：\n1) 若输出文件已存在且含当日数据，直接结束并说明，禁止重复生成。\n2) 若缺源文件，直接结束并说明缺什么，禁止用推测值替代。\n3) 本机 PATH 可能没有 python，执行 Python 一律用绝对路径解释器。\n4) 结束时只用纯文本输出结论摘要，不生成额外的说明文件。\n回溯说明：{notes}"
@@ -40,6 +68,8 @@
     "entry": "C:/Program Files/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy",
     "git_bash": "C:/Program Files/WorkBuddy/resources/vendor/PortableGit/bin/bash.exe",
     "product_version": "",
+    "output_format": "stream-json",
+    "_output_format 说明": "stream-json = 实时流，跑动时就能看到工具调用；text = 全缓冲，长任务中途日志不动。",
     "perm_variants": [
       ["--permission-mode", "acceptEdits", "-y", "--allowedTools", "Bash(*),Read,Write,Edit,Glob,Grep"],
       ["-y"],

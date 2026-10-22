@@ -10,7 +10,9 @@ file-watcher-automation-template
   - CLI 必须强制精简产物（CODEBUDDY_FORCE_LITE_WB_BUNDLE=1），否则报 MODULE_NOT_FOUND。
   - CLI 的 bash 环境 PATH 与你的终端不同，python 一律用绝对路径。
   - 日志只回显参数，不回显提示词，避免自检关键字被自己污染。
-  - 补日场景会并发触发多天任务，必须串行排队，否则同写一个输出文件会互相覆盖。
+  - 补日场景会并发触发多天任务，必须按日期升序串行，否则同写一个输出文件会互相覆盖。
+  - --output-format text 重定向到文件是全缓冲，长任务中途看不到任何输出，改用 stream-json。
+  - 判定「同一天的两份文件谁更新」不能只比大小：改一个数字字节数常常完全一致。
 
 目录约定：
   <project>/scripts/watcher.py     ← 本文件
@@ -18,6 +20,7 @@ file-watcher-automation-template
   <project>/<source dir>/...       ← 各源文件目录
   <project>/<log_dir>/             ← 运行日志（自动创建）
   <project>/<trigger_dir>/         ← ready 标记、锁（自动创建）
+  <project>/<conclusion_dir>/      ← 每次任务完成的结论摘要（自动创建）
 """
 
 import os
@@ -25,6 +28,8 @@ import re
 import sys
 import json
 import time
+import glob
+import queue
 import hashlib
 import shutil
 import threading
@@ -50,19 +55,30 @@ except Exception:
 DEFAULT_CONFIG = {
     "log_dir": "_logs",
     "trigger_dir": "_trigger",
+    "conclusion_dir": "conclusions",
     "poll_seconds": 5,
     "stable_seconds": 3,
-    "lookback_days": 1,
+    # 补日窗口：往前追几天。源文件到位时间不固定时把它调大（如 7）。
+    "lookback_days": 7,
+    # 缺件等待日志的心跳间隔（秒）。整天没件时靠它证明监听还活着。
+    "wait_log_interval_seconds": 1800,
     "auto_run": True,
     "preflight_on_start": True,
     "run_timeout": 5400,
+    # 产物判定：该日期已存在匹配文件时永不重跑，防止放宽窗口后推翻历史结果。
+    # 支持 {y} {m} {d} 占位（不补零），例：output/报表{y}.{m}.{d}*.xlsx
+    "produced_glob": "",
     "sources": [],
+    # 外部来源（下载目录、聊天软件落盘目录等）：只复制不移动，按 mtime 取最新。
+    "external_sources": [],
     "task": {"spec_doc": "", "prompt": ""},
     "cli": {
         "node": "",
         "entry": "",
         "git_bash": "",
         "product_version": "",
+        # text（全缓冲，中途无输出）/ stream-json（实时流，推荐）
+        "output_format": "stream-json",
         "perm_variants": [
             ["--permission-mode", "acceptEdits", "-y",
              "--allowedTools", "Bash(*),Read,Write,Edit,Glob,Grep"],
@@ -93,10 +109,14 @@ def load_config():
 CFG = load_config()
 LOGDIR = ROOT / CFG["log_dir"]
 TRIGGER = ROOT / CFG["trigger_dir"]
-for d in (LOGDIR, TRIGGER):
+CONC_DIR = ROOT / CFG.get("conclusion_dir", "conclusions")
+STREAM_DIR = LOGDIR / "_stream"
+for d in (LOGDIR, TRIGGER, CONC_DIR, STREAM_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 IGNORE_PREFIX = ("~$", "._", ".")
+# 判定「谁更新」时容许的 mtime 误差，避免复制动作本身带来的毫秒级抖动误判
+MTIME_TOL = 2.0
 
 
 # ---------------------------------------------------------------- 工具
@@ -164,7 +184,78 @@ def _resolve_dup(p: Path) -> Path:
     return p
 
 
+# ---------------------------------------------------------------- 取件与产物判定
+SKIP_SAME = "SKIP_SAME"     # 目标已在位且内容一致，无需动作
+SKIP_STALE = "SKIP_STALE"   # 候选比在位版本更旧，弃用
+OLD_DIR = LOGDIR / "_history"
+
+
+def adopt(src: Path, dst: Path, copy_mode=True):
+    """把候选文件放到目标位置，返回 (ok, note)。
+
+    判定「谁是新版」的三层规则（只比大小的做法会把修正版当重复丢掉：
+    改一个数字的修正版，字节数常常完全一致）：
+      1. 大小不同 → 直接比 mtime
+      2. 大小相同 → 比 SHA256；一致即真重复，返回 SKIP_SAME
+      3. 内容不同 → 源 mtime 比在位版本新过 MTIME_TOL 才替换，否则返回 SKIP_STALE
+    被替换的旧版不删除，移到 <log_dir>/_history/。
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    note = "新增"
+    if dst.exists():
+        same = False
+        try:
+            if dst.stat().st_size == src.stat().st_size:
+                same = sha256(dst) == sha256(src)
+        except OSError:
+            same = False
+        if same:
+            return True, SKIP_SAME
+        try:
+            newer = src.stat().st_mtime > dst.stat().st_mtime + MTIME_TOL
+        except OSError:
+            newer = False
+        if not newer:
+            return True, SKIP_STALE
+        OLD_DIR.mkdir(parents=True, exist_ok=True)
+        old_ts = datetime.fromtimestamp(dst.stat().st_mtime).strftime("%Y%m%d-%H%M%S")
+        bak = OLD_DIR / f"{dst.stem}.{old_ts}{dst.suffix}"
+        shutil.move(str(dst), str(bak))
+        note = f"替换旧版（旧版存 _history/{bak.name}）"
+    if copy_mode:
+        shutil.copy2(str(src), str(dst))   # copy2 保留 mtime，供下次比较
+    else:
+        shutil.move(str(src), str(dst))
+    return True, note
+
+
+def has_produced(day: str) -> bool:
+    """该日期是否已经产出过结果文件（produced_glob 为空则视为不启用）。
+    {y}{m}{d} 不补零，避免「10.1」与「10.11」撞号（后面若紧跟非数字字符即安全）。"""
+    g = CFG.get("produced_glob") or ""
+    if not g:
+        return False
+    try:
+        y, m, d = [int(x) for x in day.split("-")]
+        pat = g.format(y=y, m=m, d=d)
+    except Exception:
+        return False
+    base = pat if os.path.isabs(pat) else str(ROOT / pat)
+    return bool(glob.glob(base))
+
+
 # ---------------------------------------------------------------- 源文件解析
+DUP_SUFFIX = re.compile(r"\s*(?:[\(\（]\d+[\)\）]|-\s*副本(?:\s*[\(\（]\d+[\)\）]?)?)\s*$")
+
+
+def strip_dup(name: str) -> str:
+    """去掉重复下载产生的 (1)（1）- 副本，再做匹配。
+    不做这一步的话，同名文件第二次下载成「X(1).xlsx」就匹配不上规则，
+    「取 mtime 最新」也就永远看不到第二份了。"""
+    stem, ext = os.path.splitext(name)
+    return DUP_SUFFIX.sub("", stem) + ext
+
+
 class Source:
     """一个源：目录 + 文件名正则。
 
@@ -183,7 +274,7 @@ class Source:
         self.date_source = spec.get("date_source") or default_date_source
 
     def matches(self, name: str) -> bool:
-        return bool(self.pattern.match(name))
+        return bool(self.pattern.match(strip_dup(name)))
 
     def std_path(self, day: str) -> Path:
         y, m, d = [int(x) for x in day.split("-")]
@@ -193,14 +284,15 @@ class Source:
 
     def parse_date(self, path: Path):
         """返回该文件归属的日期；不是本类型或不合法则返回 None"""
-        if not self.matches(path.name):
+        name = strip_dup(path.name)
+        if not self.pattern.match(name):
             return None
         if self.date_source == "mtime":
             try:
                 return datetime.fromtimestamp(path.stat().st_mtime).date()
             except OSError:
                 return None
-        g = self.pattern.match(path.name).groupdict()
+        g = self.pattern.match(name).groupdict()
         try:
             now = datetime.now()
             y = int(g["y"]) if g.get("y") else now.year
@@ -248,6 +340,109 @@ class Source:
 
 SOURCES = [Source(s, CFG.get("date_source", "filename"))
            for s in CFG.get("sources", [])]
+
+
+# ---------------------------------------------------------------- 外部来源取件
+# 场景：文件先落在别处（浏览器下载目录、聊天软件的文件目录），
+# 使用者不会手动另存。此时只靠监听源目录永远等不到文件。
+# 规则：按 Source 的文件名正则去外部目录里认领，复制到源目录，绝不移动/删除原件。
+def _ext_cfgs():
+    out = []
+    for e in (CFG.get("external_sources") or []):
+        if not e.get("enabled"):
+            continue
+        root = Path(e.get("root") or "")
+        if not str(e.get("root") or "").strip():
+            continue
+        out.append({
+            "name": e.get("name") or root.name or "external",
+            "root": root,
+            # depth = 从 root 往下最多走几层子目录（root 的直接子项算第 1 层）。
+            # 微信 4.x 的文件在 <root>\<wxid>\msg\file\<YYYY-MM>\，需要 3 层以上。
+            "depth": int(e.get("depth", 4)),
+            "max_age_days": float(e.get("max_age_days", 8)),
+            "interval_seconds": float(e.get("interval_seconds", 30)),
+            "only": list(e.get("sources") or []),
+        })
+    return out
+
+
+def scan_external(cfg):
+    """返回 [(Source, path)]，只做匹配不做稳定性判断"""
+    cutoff = time.time() - cfg["max_age_days"] * 86400
+    targets = [s for s in SOURCES if not cfg["only"] or s.name in cfg["only"]]
+    targets = [s for s in targets if s.date_source != "mtime"]  # mtime 源无法按日期落位
+    out = []
+    if not cfg["root"].exists() or not targets:
+        return out
+
+    def walk(d: Path, lvl: int):
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            return
+        for p in entries:
+            if p.is_dir():
+                if lvl < cfg["depth"]:
+                    walk(p, lvl + 1)
+                continue
+            if not p.is_file() or p.name.startswith(IGNORE_PREFIX):
+                continue
+            try:
+                if p.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            for s in targets:
+                if s.matches(p.name):
+                    out.append((s, p))
+                    break
+
+    walk(cfg["root"], 1)
+    return out
+
+
+def dedupe_external(cands):
+    """同一「源+日期」可能有多份（重复下载、对方发的修正版），只留 mtime 最新一份"""
+    best = {}
+    for s, p in cands:
+        day = s.parse_date(p)
+        if day is None:
+            continue
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        key = (s.name, day.isoformat())
+        if key not in best or mt > best[key][0]:
+            best[key] = (mt, s, p)
+    return [(v[1], v[2]) for v in best.values()]
+
+
+def pickup_external(cands):
+    """复制外部候选文件到源目录。返回实际搬运数量"""
+    n = 0
+    for s, p in cands:
+        day = s.parse_date(p)
+        if day is None:
+            continue
+        if not _is_stable(p, min_age=CFG["stable_seconds"]):
+            continue
+        dst = s.std_path(day.isoformat())
+        try:
+            ok, note = adopt(p, dst, copy_mode=True)
+        except Exception as e:
+            log(f"外部取件失败 [{s.name}] {p.name}：{e}")
+            continue
+        if note in (SKIP_SAME, SKIP_STALE):
+            continue
+        try:
+            rel = dst.relative_to(ROOT)
+        except Exception:
+            rel = dst
+        log(f"外部取件 [{s.name}] {p.name} -> {rel}｜{note}")
+        n += 1
+    return n
 
 
 def check_ready(day: str):
@@ -320,21 +515,153 @@ def _cli_env():
     return env
 
 
+def _stream_line_to_text(line: str) -> str:
+    """把 stream-json 的一行事件转成人读文本。解析不了一律原样保留（stderr、
+    错误堆栈、Node 警告都在这些行里，瞬时故障重试就是靠它们判定的）。"""
+    s = line.rstrip("\r\n")
+    if not s.strip():
+        return ""
+    try:
+        ev = json.loads(s)
+    except Exception:
+        return s
+    if not isinstance(ev, dict):
+        return s
+    t = ev.get("type")
+    if t == "system":
+        model = ev.get("model") or (ev.get("message") or {}).get("model") or "?"
+        return f"[会话] {ev.get('subtype', 'init')}｜model={model}"
+    if t == "assistant":
+        out = []
+        for c in ((ev.get("message") or {}).get("content") or []):
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "text" and c.get("text", "").strip():
+                out.append(c["text"].rstrip())
+            elif c.get("type") == "tool_use":
+                inp = c.get("input") or {}
+                brief = (inp.get("command") or inp.get("file_path")
+                         or inp.get("pattern") or inp.get("description") or "")
+                out.append(f"[工具] {c.get('name', '?')}｜{str(brief)[:130]}")
+        return "\n".join(out)
+    if t == "user":
+        # tool_result 正常内容不记，只保留报错，避免日志被回显撑爆
+        for c in ((ev.get("message") or {}).get("content") or []):
+            if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error"):
+                txt = c.get("content")
+                if isinstance(txt, list):
+                    txt = " ".join(x.get("text", "") for x in txt if isinstance(x, dict))
+                return "[工具报错] " + str(txt)[:200]
+        return ""
+    if t == "result":
+        parts = [f"[完成] subtype={ev.get('subtype', '?')}"]
+        dur = ev.get("duration_ms")
+        if isinstance(dur, (int, float)):
+            parts.append(f"耗时 {dur / 1000:.1f}s")
+        if ev.get("is_error"):
+            parts.append("is_error=true")
+        return "  ".join(parts)
+    return f"[事件] type={t}"
+
+
 def _run_cli(prompt, out_log: Path, timeout, title, extra_args=None):
-    """统一 CLI 调用：无窗口 + stdin 断开 + 强制精简产物。
-    日志只回显权限参数，绝不回显提示词（否则关键字会污染自检判定）。"""
+    """统一 CLI 调用：无窗口 + stdin 断开 + 强制精简产物 + 实时流输出。
+
+    日志只回显权限参数，绝不回显提示词（否则关键字会污染自检判定）。
+    --output-format text 会被全缓冲，长任务中途看不到任何东西；
+    改用 stream-json 后逐行读取、逐行 flush，跑动时就能看到工具调用。
+    """
     import subprocess
     c = _cli_cfg()
     perm = list(extra_args or c["variants"][0])
-    cmd = [c["node"], c["entry"], "-p", prompt] + perm + ["--output-format", "text"]
+    fmt = (CFG.get("cli") or {}).get("output_format") or "stream-json"
+    cmd = [c["node"], c["entry"], "-p", prompt] + perm + ["--output-format", fmt]
     flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-    with open(out_log, "a", encoding="utf-8") as fh:
+    STREAM_DIR.mkdir(parents=True, exist_ok=True)
+    stream_log = STREAM_DIR / f"{Path(out_log).stem}-{datetime.now():%Y%m%d-%H%M%S}.jsonl"
+    holder = {"result": ""}
+
+    with open(out_log, "a", encoding="utf-8") as fh, \
+            open(stream_log, "w", encoding="utf-8") as sf:
         fh.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {title} =====\n")
-        fh.write(f"[args] {' '.join(perm)}\n")
+        fh.write(f"[args] {' '.join(perm)}｜format={fmt}\n")
         fh.flush()
-        return subprocess.run(cmd, cwd=str(ROOT), stdin=subprocess.DEVNULL,
-                              stdout=fh, stderr=subprocess.STDOUT,
-                              env=_cli_env(), creationflags=flags, timeout=timeout)
+        proc = subprocess.Popen(
+            cmd, cwd=str(ROOT), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=_cli_env(), creationflags=flags,
+            text=True, encoding="utf-8", errors="replace", bufsize=1)
+
+        def pump():
+            try:
+                for line in proc.stdout:
+                    sf.write(line)
+                    sf.flush()
+                    if fmt == "stream-json":
+                        txt = _stream_line_to_text(line)
+                        t = _assistant_text(line)      # 只取正文，供结论摘要用
+                        if t:
+                            holder["result"] = t
+                    else:
+                        txt = line.rstrip("\r\n")
+                    if txt:
+                        fh.write(txt + "\n")
+                        fh.flush()
+            except Exception:
+                pass
+
+        th = threading.Thread(target=pump, daemon=True)
+        th.start()
+        rc = None
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = -9
+        th.join(5)
+        fh.write(f"[退出] returncode={rc}｜{datetime.now():%Y-%m-%d %H:%M:%S}\n")
+        fh.flush()
+
+    r = subprocess.CompletedProcess(cmd, rc)
+    r.result_text = holder["result"]
+    r.stream_log = stream_log
+    return r
+
+
+def _assistant_text(line: str) -> str:
+    """取 assistant 事件的正文（不含工具调用），用于结论摘要"""
+    try:
+        ev = json.loads(line)
+    except Exception:
+        return ""
+    if not isinstance(ev, dict) or ev.get("type") != "assistant":
+        return ""
+    parts = [c.get("text", "") for c in ((ev.get("message") or {}).get("content") or [])
+             if isinstance(c, dict) and c.get("type") == "text"]
+    return "\n".join(p.strip() for p in parts if p and p.strip())
+
+
+def save_conclusion(day: str, r, elapsed: float, out_log: Path):
+    """把任务结果写成 <conclusion_dir>/<日期>.md，人不用翻冗长日志"""
+    try:
+        body = (getattr(r, "result_text", "") or "").strip()
+        lines = [
+            f"# {day} 任务执行结论",
+            "",
+            f"- 完成时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"- 耗时：{elapsed / 60:.1f} 分钟",
+            f"- 退出码：{r.returncode}",
+            f"- 输出日志：{out_log.name}",
+            f"- 原始事件流：{getattr(r, 'stream_log', '') or '（无）'}",
+            "",
+            "## 结论",
+            "",
+            body or "（本次未取到 result 正文，请查看输出日志）",
+            "",
+        ]
+        (CONC_DIR / f"{day}.md").write_text("\n".join(lines), encoding="utf-8")
+    except Exception as e:
+        log(f"结论写入失败：{e}")
 
 
 TRANSIENT_HINTS = ("temporarily unavailable", "500", "502", "503", "504", "429",
@@ -441,34 +768,90 @@ def _perm_args():
 
 
 # ---------------------------------------------------------------- 执行任务
-_RUN_SERIAL = threading.Lock()
+_RUN_SERIAL = threading.Lock()   # 手动单日调用时的互斥（主循环走队列）
+
+# 待执行队列：补日窗口内可能同时有多天齐备，必须严格按日期升序逐个跑。
+# 后一天产物依赖前一天产物，顺序错会算错累计数；靠「抢锁」无法保证顺序。
+_RUN_QUEUE = queue.Queue()
+_QUEUED = set()
+# 缺件等待日志状态：day -> (缺件签名, 上次记录时间戳)
+_MISS = {}
+
+
+def _task_worker():
+    """唯一的任务执行线程：从队列按入队顺序取，天然串行"""
+    while True:
+        day = _RUN_QUEUE.get()
+        try:
+            run_task(day)
+        except Exception as e:
+            log(f"任务异常 {day}｜{e}")
+        finally:
+            _QUEUED.discard(day)
+            _RUN_QUEUE.task_done()
+
+
+def enqueue_task(day: str) -> bool:
+    """入队（去重）。调用方按日期升序调用，队列保证按此顺序执行"""
+    if day in _QUEUED:
+        return False
+    _QUEUED.add(day)
+    _RUN_QUEUE.put(day)
+    return True
 
 
 def run_task(day: str):
-    """跑一次任务。同一天跑过就跳过；成功的标记写 _trigger/_done/<day>.ok"""
+    """跑一次任务。同日跑过就跳过；成功的标记写 <trigger>/_done/<day>.ok"""
     done = TRIGGER / "_done" / f"{day}.ok"
+    lock = TRIGGER / "_running" / f"{day}.lock"
     done.parent.mkdir(parents=True, exist_ok=True)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+
     if done.exists():
         log(f"跳过：{day} 已完成")
         return
+    if lock.exists():
+        # 断电/进程被杀时锁不会被清掉，会把该日期永久堵死，
+        # 所以超过「单次超时 + 5 分钟」的锁一律视为残骸，清掉继续。
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            age = 0.0
+        if age > CFG["run_timeout"] + 300:
+            log(f"清理陈旧执行锁：{day}（残留 {age / 60:.0f} 分钟，判定为上次异常退出）")
+            lock.unlink(missing_ok=True)
+        else:
+            log(f"跳过：{day} 正在执行中")
+            return
+
     out_log = LOGDIR / f"run-{day}.log"
+    lock.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+    t0 = time.time()
     try:
         log(f"开始执行：{day}｜输出 {out_log.name}")
         r = _run_cli_retry(build_prompt(day), out_log, CFG["run_timeout"],
                            f"执行 {day}", extra_args=_perm_args())
+        elapsed = time.time() - t0
         if r.returncode == 0:
-            done.write_text(datetime.now().isoformat(), encoding="utf-8")
-            log(f"执行完成：{day}（exit 0）")
-            notify("任务完成", f"{day} 已执行，日志 {out_log.name}")
+            done.write_text(json.dumps(
+                {"day": day, "at": datetime.now().isoformat(timespec="seconds"),
+                 "elapsed_seconds": round(elapsed, 1), "exit": 0},
+                ensure_ascii=False), encoding="utf-8")
+            log(f"执行完成：{day}（exit 0，耗时 {elapsed / 60:.1f} 分钟）")
+            save_conclusion(day, r, elapsed, out_log)
+            notify("任务完成", f"{day} 已执行，结论见 {CONC_DIR.name}/{day}.md")
         else:
             log(f"执行失败：{day}（exit {r.returncode}）｜详见 {out_log.name}")
+            save_conclusion(day, r, elapsed, out_log)
             notify("任务失败", f"{day} exit {r.returncode}")
     except Exception as e:
         log(f"执行异常：{day}｜{e}")
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def run_task_serial(day: str):
-    """按日串行，保证前一日先完成（后一日常依赖前一日的产物）"""
+    """按日串行（保留给手动调用；主循环请用 enqueue_task）"""
     if not _RUN_SERIAL.acquire(timeout=CFG["run_timeout"] + 600):
         log(f"排队超时：{day}")
         return
@@ -527,24 +910,74 @@ def main():
             mark.write_text(datetime.now().isoformat(), encoding="utf-8")
             threading.Thread(target=run_preflight, daemon=True).start()
 
+    threading.Thread(target=_task_worker, daemon=True).start()
+    log(f"任务执行线程已启动｜补日窗口 {CFG.get('lookback_days', 7)} 天")
+
+    ext = _ext_cfgs()
+    ext_next = {c["name"]: 0.0 for c in ext}
+    if ext:
+        log("外部来源已启用｜" + "；".join(f"{c['name']} <- {c['root']}" for c in ext))
+
     warned = set()
     try:
         while True:
             try:
+                # 外部来源取件：文件先落在下载目录/聊天软件目录时，靠这一步认领
+                for c in ext:
+                    if time.time() < ext_next[c["name"]]:
+                        continue
+                    ext_next[c["name"]] = time.time() + c["interval_seconds"]
+                    try:
+                        pickup_external(dedupe_external(scan_external(c)))
+                    except Exception as e:
+                        log(f"外部取件异常 {c['name']}：{e}")
+
+                # 齐备检查：最近 N 天内、尚未出产物、尚未开跑的日期。
+                # 源文件到位时间不固定（可能今天才到前天的、也可能今天的明天才到），
+                # 所以窗口由 lookback_days 决定；已出过产物的一律跳过，绝不动已有结果。
                 today = datetime.now().date()
-                days = {(today - timedelta(days=i)).isoformat()
-                        for i in range(CFG.get("lookback_days", 1) + 1)}
+                look = max(1, int(CFG.get("lookback_days", 7)))
+                days = [(today - timedelta(days=i)).isoformat() for i in range(look)]
+                done_dir = TRIGGER / "_done"
                 for day in sorted(days):
+                    if day in _QUEUED:
+                        continue
+                    if (done_dir / f"{day}.ok").exists():
+                        continue
+                    if has_produced(day):
+                        if day not in warned:
+                            warned.add(day)
+                            log(f"{day} 已有产物，跳过（不重算）")
+                        continue
                     ok, missing, rp = check_ready(day)
-                    if ok and day not in warned:
-                        warned.add(day)
-                        log(f"源文件齐备（{day}），标记 {rp.name}")
-                        if CFG.get("auto_run"):
-                            threading.Thread(target=run_task_serial, args=(day,), daemon=True).start()
-                        else:
-                            notify("源文件已齐备", f"{day} 可执行任务（auto_run=false，需人工触发）")
-                    elif not ok:
+                    if ok:
+                        _MISS.pop(day, None)
+                        if day not in warned:
+                            warned.add(day)
+                            log(f"源文件齐备（{day}），标记 {rp.name}")
+                            if CFG.get("auto_run"):
+                                if enqueue_task(day):
+                                    log(f"已入队：{day}（队列待执行 {_RUN_QUEUE.qsize()}）")
+                            else:
+                                notify("源文件已齐备",
+                                       f"{day} 可执行任务（auto_run=false，需人工触发）")
+                    else:
                         warned.discard(day)
+                        # 缺件状态变化时记一次；之后按心跳间隔留一行，证明守着没死
+                        sig = tuple(missing)
+                        prev = _MISS.get(day)
+                        now_ts = time.time()
+                        hb = max(60, int(CFG.get("wait_log_interval_seconds", 1800)))
+                        if prev is None:
+                            _MISS[day] = (sig, now_ts)
+                            log(f"{day} 等待源文件：缺 {'、'.join(missing)}")
+                        elif prev[0] != sig:
+                            _MISS[day] = (sig, now_ts)
+                            log(f"{day} 缺件有变化：现缺 {'、'.join(missing) if missing else '（写入中）'}")
+                        elif now_ts - prev[1] >= hb:
+                            _MISS[day] = (sig, now_ts)
+                            log(f"{day} 仍在等待源文件：缺 {'、'.join(missing)}"
+                                f"（监听正常，每 {hb // 60} 分钟报一次）")
                 time.sleep(CFG["poll_seconds"])
             except Exception as e:
                 log(f"主循环异常：{e}")
@@ -560,9 +993,21 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
+        for c in _ext_cfgs():
+            n = pickup_external(dedupe_external(scan_external(c)))
+            log(f"外部取件 [{c['name']}]：搬运 {n} 个")
         day = sys.argv[2] if len(sys.argv) > 2 else datetime.now().date().isoformat()
         ok, missing, rp = check_ready(day)
         log(f"单次检查 {day}：{'齐备' if ok else '缺 ' + ','.join(missing)}")
         print(build_prompt(day))
+        sys.exit(0)
+    if len(sys.argv) > 1 and sys.argv[1] == "--pickup":
+        for c in _ext_cfgs():
+            cands = dedupe_external(scan_external(c))
+            log(f"外部来源 [{c['name']}]：候选 {len(cands)} 个")
+            for s, p in cands:
+                log(f"  {s.name}｜{p.name}｜{p.stat().st_size} B")
+            n = pickup_external(cands)
+            log(f"实际搬运 {n} 个")
         sys.exit(0)
     main()
