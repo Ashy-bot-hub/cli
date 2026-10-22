@@ -1,0 +1,41 @@
+{
+  "_说明": "复制为 config.json 后按自己的任务改。文件名正则用命名分组 y/m/d 取日期，缺 y 时按当年。",
+  "log_dir": "_logs",
+  "trigger_dir": "_trigger",
+  "poll_seconds": 5,
+  "stable_seconds": 3,
+  "lookback_days": 1,
+  "auto_run": true,
+  "preflight_on_start": true,
+  "run_timeout": 5400,
+  "sources": [
+    {
+      "name": "生产日报",
+      "dir": "source_a",
+      "pattern": "^生产日报_(?P<m>\\d{1,2})[.-](?P<d>\\d{1,2})\\.xlsx$",
+      "std_name": "生产日报_{m}.{d}.xlsx"
+    },
+    {
+      "name": "出入库",
+      "dir": "source_b",
+      "pattern": "^出入库_(?P<y>\\d{4})年(?P<m>\\d{1,2})月(?P<d>\\d{1,2})日\\.xlsx$",
+      "std_name": "出入库_{y}年{m}月{d}日.xlsx",
+      "allow_newer_fallback": true
+    }
+  ],
+  "task": {
+    "spec_doc": "task_spec.md",
+    "prompt": "工作目录 {root}。严格按 {spec} 的全部口径，生成 {day} 的报表。\n约束：\n1) 若输出文件已存在且含当日数据，直接结束并说明，禁止重复生成。\n2) 若缺源文件，直接结束并说明缺什么，禁止用推测值替代。\n3) 本机 PATH 可能没有 python，执行 Python 一律用绝对路径解释器。\n4) 结束时只用纯文本输出结论摘要，不生成额外的说明文件。\n回溯说明：{notes}"
+  },
+  "cli": {
+    "node": "C:/Program Files/nodejs/node.exe",
+    "entry": "C:/Program Files/WorkBuddy/resources/app.asar.unpacked/cli/bin/codebuddy",
+    "git_bash": "C:/Program Files/WorkBuddy/resources/vendor/PortableGit/bin/bash.exe",
+    "product_version": "",
+    "perm_variants": [
+      ["--permission-mode", "acceptEdits", "-y", "--allowedTools", "Bash(*),Read,Write,Edit,Glob,Grep"],
+      ["-y"],
+      ["--permission-mode", "bypassPermissions", "-y"]
+    ]
+  }
+}
