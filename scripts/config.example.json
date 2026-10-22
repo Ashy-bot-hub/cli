@@ -2,6 +2,7 @@
   "_说明": "复制为 config.json 后按自己的任务改。文件名正则用命名分组 y/m/d 取日期，缺 y 时按当年。",
   "log_dir": "_logs",
   "trigger_dir": "_trigger",
+  "date_source": "filename",
   "poll_seconds": 5,
   "stable_seconds": 3,
   "lookback_days": 1,
@@ -21,6 +22,13 @@
       "pattern": "^出入库_(?P<y>\\d{4})年(?P<m>\\d{1,2})月(?P<d>\\d{1,2})日\\.xlsx$",
       "std_name": "出入库_{y}年{m}月{d}日.xlsx",
       "allow_newer_fallback": true
+    },
+    {
+      "_注": "文件名不含日期的场景：date_source 设 mtime，正则只判断类型",
+      "name": "银行流水",
+      "dir": "source_c",
+      "pattern": "^银行流水",
+      "date_source": "mtime"
     }
   ],
   "task": {

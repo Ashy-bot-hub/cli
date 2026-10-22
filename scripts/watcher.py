@@ -166,14 +166,24 @@ def _resolve_dup(p: Path) -> Path:
 
 # ---------------------------------------------------------------- 源文件解析
 class Source:
-    """一个源：目录 + 文件名正则（用命名分组 y/m/d 取日期）"""
+    """一个源：目录 + 文件名正则。
 
-    def __init__(self, spec):
+    日期从哪来由 date_source 决定：
+      "filename"（默认）：正则里用命名分组 y/m/d 取日期，y 可省略（按当年）
+      "mtime"：正则只负责判断「是不是我这类型文件」，日期取文件的最后修改时间
+               适合文件名固定、当天覆盖的报表（如「银行流水.xlsx」）
+    """
+
+    def __init__(self, spec, default_date_source="filename"):
         self.name = spec.get("name") or spec.get("dir", "source")
         self.dir = ROOT / spec["dir"]
         self.pattern = re.compile(spec["pattern"])
         self.allow_newer = bool(spec.get("allow_newer_fallback", False))
         self.std_name = spec.get("std_name", "")  # 可选：如 "A_{m}-{d}.xlsx"
+        self.date_source = spec.get("date_source") or default_date_source
+
+    def matches(self, name: str) -> bool:
+        return bool(self.pattern.match(name))
 
     def std_path(self, day: str) -> Path:
         y, m, d = [int(x) for x in day.split("-")]
@@ -181,23 +191,33 @@ class Source:
             return self.dir / self.std_name.format(y=y, m=m, d=d)
         return self.dir / f"{self.name}_{y}{m:02d}{d:02d}.xlsx"
 
-    def parse_date(self, name: str):
-        """name 传完整文件名（含扩展名），正则里请把扩展名也写上"""
-        m = self.pattern.match(name)
-        if not m:
+    def parse_date(self, path: Path):
+        """返回该文件归属的日期；不是本类型或不合法则返回 None"""
+        if not self.matches(path.name):
             return None
-        g = m.groupdict()
+        if self.date_source == "mtime":
+            try:
+                return datetime.fromtimestamp(path.stat().st_mtime).date()
+            except OSError:
+                return None
+        g = self.pattern.match(path.name).groupdict()
         try:
             now = datetime.now()
-            y = int(g["y"]) if "y" in g and g.get("y") else now.year
+            y = int(g["y"]) if g.get("y") else now.year
             mo = int(g["m"])
             dd = int(g["d"])
             return datetime(y, mo, dd).date()
         except Exception:
             return None
 
-    def exact(self, day: str) -> Path:
-        return _resolve_dup(self.std_path(day))
+    def exact(self, day: str):
+        """当日文件。mtime 模式下按修改时间落在该日挑选，返回 None 表示没有"""
+        if self.date_source != "mtime":
+            p = _resolve_dup(self.std_path(day))
+            return p if p.exists() else None
+        day_d = datetime.fromisoformat(day).date()
+        hits = [(f.stat().st_mtime, f) for d, f in self.list_all() if d == day_d]
+        return max(hits, key=lambda t: t[0])[1] if hits else None
 
     def list_all(self):
         out = []
@@ -206,26 +226,28 @@ class Source:
         for f in self.dir.iterdir():
             if not f.is_file() or f.name.startswith(IGNORE_PREFIX):
                 continue
-            dt = self.parse_date(f.name)
+            dt = self.parse_date(f)
             if dt:
                 out.append((dt, f))
-        return sorted(out, key=lambda t: t[0])
+        return sorted(out, key=lambda t: (t[0], t[1].stat().st_mtime))
 
     def pick(self, day: str):
-        """返回 (path, 是否回溯, 实际日期)。当日缺失且允许回溯时，取日期更晚的最近一份。"""
+        """返回 (path 或 None, 是否回溯, 实际日期)。
+        当日缺失且 allow_newer_fallback 时，取日期更晚的最近一份（适合周期累计堆叠表）。"""
         day_d = datetime.fromisoformat(day).date()
         p = self.exact(day)
-        if p.exists():
+        if p is not None:
             return p, False, day_d
         if self.allow_newer:
             newer = [(d, f) for d, f in self.list_all() if d >= day_d]
             if newer:
                 d, f = newer[0]
                 return f, True, d
-        return self.std_path(day), False, day_d
+        return None, False, day_d
 
 
-SOURCES = [Source(s) for s in CFG.get("sources", [])]
+SOURCES = [Source(s, CFG.get("date_source", "filename"))
+           for s in CFG.get("sources", [])]
 
 
 def check_ready(day: str):
@@ -234,8 +256,8 @@ def check_ready(day: str):
     picks, missing, unstable = [], [], []
     for s in SOURCES:
         p, fb, cov = s.pick(day)
-        if not p.exists():
-            missing.append(f"{s.name}:{p.name}")
+        if p is None:
+            missing.append(f"{s.name}（{s.dir.name}/ 当日无匹配文件）")
             continue
         if not _is_stable(p):
             unstable.append(f"{s.name}:{p.name}")
@@ -266,7 +288,7 @@ def build_prompt(day: str):
     notes = []
     for s in SOURCES:
         p, fb, cov = s.pick(day)
-        if fb:
+        if fb and p is not None:
             notes.append(f"{s.name} 当日文件缺失，改用 {p.name}（覆盖至 {cov}）回溯取 {day} 这一段；"
                          f"禁止用其他日期顶替或外推，摘要中须注明「{s.name} 源为 {p.name} 回溯取数」。")
     return tpl.format(root=ROOT, spec=(ROOT / spec) if spec else "",
