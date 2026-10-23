@@ -15,6 +15,12 @@
   "auto_run": true,
   "preflight_on_start": true,
   "run_timeout": 5400,
+  "notify_sticky": true,
+  "_notify_sticky 说明": "关键结果（产物出没出、跑成功没有、重算到没到上限）用置顶框，必须手动关，带「是/否」可直接打开结论或日志。设 false 时这类提示直接丢弃、不降级成角标——无人值守下静默失败比弹框更糟。",
+  "notify_popup": true,
+  "_notify_popup 说明": "过程事件（开始范围重算等）用几秒后自动关的角标，漏看无所谓。",
+  "notify_sound": false,
+  "_notify_sound 说明": "出声提示。无人值守时通常关掉；深夜跑批也别开。",
   "cycle": {
     "_注": "报表周期与末日整周期重算。enabled=false 则完全关闭本功能（回到「只出当天」的旧行为）。两个重算功能都依赖 produced_glob 判断产物到哪天为止。",
     "enabled": false,

@@ -161,14 +161,72 @@ def log(msg):
         pass
 
 
-def notify(title, text):
-    """任务完成提示。默认关声音，需要时在配置里开。"""
-    try:
-        import winsound
-        winsound.MessageBeep(winsound.MB_ICONASTERISK)
-    except Exception:
-        pass
+_STICKY_LAST: dict = {}
+_STICKY_GAP = 300.0        # 同一标题 5 分钟内只弹一次，补跑多天时不刷屏
+
+
+def _sticky_box(title: str, text: str, open_path=None):
+    """不会自动消失的置顶结果框。
+
+    为什么不用几秒就关的小窗：产物出没出、跑没跑成功，是「看一眼才知道
+    能不能往下走」的信息。自动消失等于没提示，人不在屏幕前就错过了。
+    这个框必须手动关，带「打开」按钮，省得再一层层点目录核对。
+
+    判据只看标题里的字、不看调用方：带失败类字眼的用错误图标，其余信息图标。
+    父窗口传 None —— pythonw 下没有控制台窗口。
+    """
+    now = time.time()
+    if now - _STICKY_LAST.get(title, 0.0) < _STICKY_GAP:
+        log(f"结果框节流跳过：{title}")
+        return
+    _STICKY_LAST[title] = now
+
+    def _pop():
+        try:
+            import ctypes
+            import subprocess
+            bad = any(k in title for k in ("失败", "未产出", "异常", "不完整", "中止", "上限"))
+            body = text
+            flags = 0x00040000 | 0x00010000          # TOPMOST | SETFOREGROUND
+            if open_path:
+                body += "\n\n【是】打开　　【否】关闭"
+                flags |= 0x00000004                   # YESNO
+            else:
+                body += "\n\n【确定】关闭"
+            flags |= 0x00000010 if bad else 0x00000040  # ERROR / INFORMATION
+            r = ctypes.windll.user32.MessageBoxW(None, body, title, flags)
+            if open_path and r == 6:
+                p = str(open_path)
+                if os.path.isfile(p):
+                    subprocess.Popen(["notepad.exe", p])
+                else:
+                    os.startfile(p)
+        except Exception as e:
+            log(f"结果框弹出失败：{title}｜{e}")
+
+    threading.Thread(target=_pop, daemon=True).start()
+
+
+def notify(title, text, sticky=False, open_path=None):
+    """任务提示。按「错过之后能不能自己发现」分三档，别一律用最响的那档。
+
+    sticky=True      置顶框，必须手动关 —— 产物出没出、跑成功没有，用这档
+    notify_popup     几秒自动关的角标 —— 过程事件，漏看也无所谓
+    notify_sound     只出声 + 写日志 —— 高频事件，否则会吵到关掉提示
+
+    open_path 给了就在框里加「是/否」，点是直接打开文件或目录。
+    """
     log(f"[通知] {title}｜{text}")
+    if sticky:
+        if CFG.get("notify_sticky", True):
+            _sticky_box(title, text, open_path)
+        return
+    if CFG.get("notify_sound"):
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
 
 
 def sha256(path, chunk=1 << 20):
@@ -1031,11 +1089,12 @@ def run_task(day: str):
                 ensure_ascii=False), encoding="utf-8")
             log(f"执行完成：{day}（exit 0，耗时 {elapsed / 60:.1f} 分钟）")
             save_conclusion(day, r, elapsed, out_log)
-            notify("任务完成", f"{day} 已执行，结论见 {CONC_DIR.name}/{day}.md")
+            notify("任务完成", f"{day} 已执行，结论见 {CONC_DIR.name}/{day}.md",
+                   sticky=True, open_path=CONC_DIR)
         else:
             log(f"执行失败：{day}（exit {r.returncode}）｜详见 {out_log.name}")
             save_conclusion(day, r, elapsed, out_log)
-            notify("任务失败", f"{day} exit {r.returncode}")
+            notify("任务失败", f"{day} exit {r.returncode}", sticky=True, open_path=out_log)
     except Exception as e:
         log(f"执行异常：{day}｜{e}")
     finally:
@@ -1203,10 +1262,11 @@ def run_scope_task(start: str, end: str, full: bool, why: str, tag: str, timeout
                  "elapsed_seconds": round(elapsed, 1), "exit": 0},
                 ensure_ascii=False), encoding="utf-8")
             log(f"范围重算完成：{tag}（exit 0，{elapsed / 60:.1f} 分钟）")
-            notify("范围重算完成", f"{tag}：{start} 至 {end}，见 {CONC_DIR.name}/{tag}.md")
+            notify("范围重算完成", f"{tag}：{start} 至 {end}，见 {CONC_DIR.name}/{tag}.md",
+                   sticky=True, open_path=CONC_DIR)
         else:
             log(f"范围重算失败：{tag}（exit {r.returncode}）｜详见 {out_log.name}")
-            notify("范围重算失败", f"{tag} exit {r.returncode}")
+            notify("范围重算失败", f"{tag} exit {r.returncode}", sticky=True, open_path=out_log)
     except Exception as e:
         log(f"范围重算异常：{tag}｜{e}")
     finally:
@@ -1395,7 +1455,8 @@ def collect_ready_fixes():
             pend.pop(key, None)
             dirty = True
             log(f"修正版待办作废：{cat} {day} 今日已重算 {n} 次，达上限 {fc['max_per_day']}")
-            notify("修正版已达次数上限", f"{cat} {day} 今日已重算 {n} 次，请人工确认")
+            notify("修正版已达次数上限", f"{cat} {day} 今日已重算 {n} 次，请人工确认",
+                   sticky=True, open_path=CONC_DIR)
             continue
         start, end, full = scope
         out.append({"start": start, "end": end, "full": full, "why": why,
