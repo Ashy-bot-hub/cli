@@ -81,8 +81,38 @@ def load_cfg() -> dict:
     }
 
 
+def _image_name(pid: int) -> str:
+    """取进程映像文件名（小写）。取不到返回空串。
+
+    为什么要它：Windows 的 pid 会被回收复用。监听器退出后，同一个 pid
+    可能立刻被 conhost.exe 之类的系统进程占用，此时「OpenProcess 成功 +
+    STILL_ACTIVE」会判成「主进程还活着」，守护就一直不拉起（2026-10-24 实测
+    pid 6088 被 conhost 复用，白等了一轮）。校验映像名才能识别这种假存活。
+    """
+    try:
+        h = ctypes.windll.kernel32.OpenProcess(
+            _QUERY_LIMITED | 0x1000, False, int(pid))   # + PROCESS_QUERY_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.c_ulong(1024)
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                h, 0, buf, ctypes.byref(size))
+            return Path(buf.value).name.lower() if ok else ""
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
 def pid_alive(pid: int) -> bool:
-    """pid 是否指向仍在运行的进程。纯 ctypes，不依赖 psutil。"""
+    """pid 是否指向仍在运行的监听器。纯 ctypes，不依赖 psutil。
+
+    判活分两步：先看退出码，再校验映像名必须是 python*（防 pid 复用）。
+    映像名取不到时（权限不足/系统进程）保守按存活处理 —— 误杀正在跑长任务的
+    进程，代价远高于多等一轮。
+    """
     if not pid or pid <= 0:
         return False
     try:
@@ -93,9 +123,14 @@ def pid_alive(pid: int) -> bool:
             code = ctypes.c_ulong()
             if not ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
                 return False
-            return code.value == _STILL_ACTIVE
+            if code.value != _STILL_ACTIVE:
+                return False
         finally:
             ctypes.windll.kernel32.CloseHandle(h)
+        name = _image_name(pid)
+        if name and not name.startswith("python"):
+            return False
+        return True
     except Exception:
         return False
 
@@ -150,7 +185,10 @@ def check_once(c: dict, state: dict, trigger=None) -> float:
     fresh = age is not None and age < c["stale"]
     desc = "心跳文件不存在" if age is None else f"心跳已 {age / 60:.0f} 分钟未更新"
 
-    if fresh:
+    # 顺序很关键：心跳只有在「pid 确实还活着」时才有意义（2026-10-24 修正）。
+    # 旧顺序先看心跳，进程刚退出、心跳还是新的，或 pid 被别的进程复用时，
+    # 会被判成「现役正常」，守护白等一整轮才拉起。
+    if fresh and alive:
         if state["stall"] or state["fails"]:
             log(f"心跳正常（pid {pid}，{age / 60:.1f} 分钟前更新），守护转入常态")
         state["stall"] = 0

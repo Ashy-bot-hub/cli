@@ -66,6 +66,22 @@ DEFAULT_CONFIG = {
     "auto_run": True,
     "preflight_on_start": True,
     "run_timeout": 5400,
+    # ---- 确定性脚本优先（第七版，2026-10-24）----
+    # 能用脚本算的就不该让模型算：脚本秒级、零 token、同输入同输出、可审计。
+    # script_cmd 是命令模板列表，支持两个占位：{py} 解释器绝对路径、{day} 日期。
+    #   例：["{py}", "scripts/gen.py", "daily", "{day}"]
+    # 退出码契约（脚本自己实现）：0 成功｜2 口径不明转模型｜3 自检不过不落盘｜
+    #                          4 当日已完成｜5 缺件。只有 2 会烧额度。
+    "script_first": False,
+    "script_timeout": 900,
+    "script_cmd": [],
+    # 本机 PATH 里没有 python 时的解释器绝对路径（留空则按内置候选顺序探测）
+    "py_exe": "",
+    # ---- 失败退避（第八版）----
+    # 入队判断独立落盘，不再依赖内存里的 warned 集合：进程重启后仍然有效，
+    # 也不会出现「某日入队失败过一次就永远不再入队、日志却写着下一轮重试」。
+    "retry_backoff_seconds": [600, 1200, 1800, 3600],
+    "retry_max": 12,
     # 产物判定：该日期已存在匹配文件时永不重跑，防止放宽窗口后推翻历史结果。
     # 支持 {y} {m} {d} 占位（不补零），例：output/报表{y}.{m}.{d}*.xlsx
     "produced_glob": "",
@@ -227,6 +243,32 @@ def notify(title, text, sticky=False, open_path=None):
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------- 弹窗自检（第九版，2026-10-24）
+POPUP_PROBE = TRIGGER / "_popup_probe.txt"
+
+
+def _check_popup_probe():
+    """弹窗链路自检：往 <trigger>/_popup_probe.txt 写一行字即可。
+
+    为什么需要它：想知道「弹窗到底弹不弹」，最自然的做法是随手起个进程弹一下，
+    但会话/工具派生的进程常常活不过一分钟，窗口跟着进程一起消失，于是得出
+    「弹不出来」的错误结论（2026-10-24 为此白查了两轮）。只有本进程弹的框，
+    才代表无人值守时真会看到的那个框。
+
+    用法：重启监听器后写入一行文字 → 下一轮轮询（默认 5 秒）按正式结果的
+    弹法弹出该文字 → 弹完自动删除探针文件 → 日志留一条记录。
+    """
+    try:
+        if not POPUP_PROBE.exists():
+            return
+        body = POPUP_PROBE.read_text(encoding="utf-8").strip() or "弹窗自检"
+        POPUP_PROBE.unlink(missing_ok=True)
+        log(f"弹窗自检：收到探针，弹出结果框｜{body[:60]}")
+        notify("弹窗自检", body, sticky=True, open_path=ROOT)
+    except Exception as e:
+        log(f"弹窗自检失败：{e}")
 
 
 def sha256(path, chunk=1 << 20):
@@ -569,6 +611,187 @@ def check_ready(day: str):
     if not (prev and prev.get("sources") == picks):
         rp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return True, [], rp
+
+
+# ---------------------------------------------------------------- 失败退避（第八版，2026-10-24）
+RETRY_DIR = TRIGGER / "_retry"
+
+
+def _retry_file(day: str):
+    return RETRY_DIR / f"{day}.json"
+
+
+def _retry_gate(day: str):
+    """现在能不能再入队。返回 (是否跑, 第几次尝试, 上次错误)。
+
+    为什么落盘而不是放内存：2026-10-24 踩过的坑 —— 入队判断被 `warned` 包着，
+    而 warned 在 while 外持久，某日只要入队过一次就再也不会重入。执行失败
+    （典型是鉴权过期）就永久卡死，日志却一直写着「下一轮重试」。改成磁盘文件：
+    跨进程重启有效，重启后不会把失败次数清零。
+    """
+    p = _retry_file(day)
+    if not p.exists():
+        return True, 1, ""
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return True, 1, ""
+    n = int(d.get("attempts") or 0)
+    if time.time() < float(d.get("next_ts") or 0):
+        return False, n, str(d.get("last_error") or "")
+    return True, n + 1, str(d.get("last_error") or "")
+
+
+def _mark_fail(day: str, reason: str):
+    """记一次失败并安排下次重试时间，返回 (第几次失败, 等待秒数)。"""
+    steps = CFG.get("retry_backoff_seconds") or [600, 1200, 1800, 3600]
+    cap = int(CFG.get("retry_max", 12))
+    p = _retry_file(day)
+    n = 0
+    try:
+        if p.exists():
+            n = int(json.loads(p.read_text(encoding="utf-8")).get("attempts") or 0)
+    except Exception:
+        n = 0
+    n += 1
+    wait = steps[min(n - 1, len(steps) - 1)]
+    if n > cap:
+        wait = 6 * 3600          # 连续失败太多次：拉到 6 小时一探，避免整点刷屏
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "day": day,
+            "attempts": n,
+            "next_ts": time.time() + wait,
+            "next_at": (datetime.now() + timedelta(seconds=wait)).isoformat(timespec="seconds"),
+            "last_error": str(reason)[:200],
+        }, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log(f"失败记录写入异常（不影响主流程）：{e}")
+    return n, wait
+
+
+def _clear_fail(day: str):
+    try:
+        _retry_file(day).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 脚本通道（第一路）
+# 第七版：能确定性算出来的结果，不该让模型即兴算。脚本秒级、零 token、
+# 同输入同输出、出错能复现；模型只负责「脚本明确说判断不了」的那部分。
+_PY_CANDIDATES = [
+    r"C:\Users\Administrator\.workbuddy\binaries\python\versions\3.14.3\python.exe",
+    r"C:\Users\Administrator\.workbuddy\binaries\python\versions\3.13.12\python.exe",
+]
+
+
+def pick_python():
+    """本机 PATH 常常没有 python 命令，必须用解释器绝对路径（配置 py_exe 可覆盖）"""
+    p = CFG.get("py_exe")
+    if p and Path(p).exists():
+        return Path(p)
+    for c in _PY_CANDIDATES:
+        if Path(c).exists():
+            return Path(c)
+    return None
+
+
+def _script_argv(day: str):
+    """按 script_cmd 模板生成命令；{py} 换成解释器绝对路径，{day} 换成日期。"""
+    raw = CFG.get("script_cmd") or []
+    if not raw:
+        return None
+    py = pick_python()
+    out = []
+    for x in raw:
+        s = str(x).replace("{day}", day)
+        if "{py}" in s:
+            s = s.replace("{py}", str(py) if py else "")
+        out.append(s)
+    return out
+
+
+def run_script(day: str, out_log: Path, timeout: float):
+    """跑确定性脚本，返回 (退出码, 输出全文, 启动失败原因)。
+
+    退出码为 None 表示脚本根本没跑起来（没配 script_cmd、解释器或脚本缺失、
+    超时、启动异常）。这类属环境问题，**不能**转交模型兜底 —— 兜底也跑不动，
+    只会白烧额度，所以调用方要单独处理。
+    """
+    import subprocess
+
+    argv = _script_argv(day)
+    if not argv:
+        return None, "", "未配置 script_cmd"
+    if not argv[0]:
+        return None, "", "找不到 python 解释器（script_cmd 用了 {py} 但本机未探测到）"
+
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            [str(x) for x in argv],
+            cwd=str(ROOT), env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+        rc = proc.returncode
+        text = proc.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired as e:
+        rc = None
+        text = (e.stdout or b"").decode("utf-8", "replace")
+        text += f"\n[超时] 超过 {timeout / 60:.0f} 分钟被终止\n"
+    except Exception as e:
+        return None, "", f"脚本启动失败：{e}"
+
+    try:
+        out_log.write_text(
+            f"# {' '.join(str(x) for x in argv)}\n"
+            f"# 退出码 {rc}｜耗时 {time.time() - t0:.1f} 秒｜"
+            f"{datetime.now():%Y-%m-%d %H:%M:%S}\n\n{text}",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    return rc, text, ""
+
+
+def _last_line(text: str) -> str:
+    for ln in reversed([x.strip() for x in (text or "").splitlines()]):
+        if ln:
+            return ln[:180]
+    return "（无输出）"
+
+
+def save_script_conclusion(day: str, rc, text, elapsed: float, event: str = "成功"):
+    """脚本通道的结论落到 <conclusion_dir>/<day>.md，与模型通道同一位置。
+
+    2026-10-24 修：原来只在成功时写，缺件/自检不过/脚本起不来这些情况在结论
+    目录里整片空白，事后完全看不出那天发生了什么。现在每个终态都写一条
+    （同一天覆盖写，不会堆积），「结论」才真的是运行日志而不是成功日志。
+    """
+    p = CONC_DIR / f"{day}.md"
+    body = (text or "").strip() or "（脚本无输出）"
+    rc_txt = "未启动" if rc is None else str(rc)
+    try:
+        CONC_DIR.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            f"# {day} 运行结论\n\n"
+            f"- 完成时间：{datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"- 结果：{event}\n"
+            f"- 通道：确定性脚本（未经模型）\n"
+            f"- 耗时：{elapsed:.1f} 秒\n"
+            f"- 退出码：{rc_txt}"
+            f"（0 成功｜2 口径不明｜3 自检不过｜4 当日已完成｜5 缺件）\n\n"
+            f"## 脚本输出\n\n```\n{body}\n```\n",
+            encoding="utf-8")
+    except Exception as e:
+        log(f"结论文件写入异常（不影响主流程）：{e}")
+    return p
 
 
 # ---------------------------------------------------------------- CLI 调用
@@ -1051,7 +1274,16 @@ def _is_queued(day: str, mode: str = None) -> bool:
 
 
 def run_task(day: str):
-    """跑一次任务。同日跑过就跳过；成功的标记写 <trigger>/_done/<day>.ok"""
+    """跑一次任务：脚本优先，模型兜底。同日跑过就跳过。
+
+    为什么先试脚本（第七版）：脚本秒级、零 token、同输入同输出，出错能复现；
+    模型适合处理「口径不明」这种真需要判断的事，不适合当计算器。分流规则只有
+    一条 —— 脚本明确说「口径不明」(exit 2) 才转模型，其余终态一律就地解决：
+      0/4 有产物 → 完成；0/4 无产物 → 假完成，记失败
+      3 自检不过 → 拦在暂存区，**不能**转模型（模型一看「已有产物」就当完成，错数就此固化）
+      5 缺件     → 转模型也造不出（口径禁止推测值）
+      None 环境问题（解释器/脚本缺失、超时）→ 转模型同样跑不动，只会白烧额度
+    """
     done = TRIGGER / "_done" / f"{day}.ok"
     lock = TRIGGER / "_running" / f"{day}.lock"
     done.parent.mkdir(parents=True, exist_ok=True)
@@ -1078,27 +1310,125 @@ def run_task(day: str):
     lock.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
     t0 = time.time()
     try:
+        # ---------------------------------------------------------- 第一路：确定性脚本
+        if CFG.get("script_first") and (CFG.get("script_cmd") or []):
+            slog = LOGDIR / f"script-{day}.log"
+            log(f"脚本通道开始：{day}")
+            rc, text, why = run_script(day, slog, float(CFG.get("script_timeout", 900)))
+            elapsed = time.time() - t0
+
+            if rc in (0, 4) and has_produced(day):
+                _finish_done(day, done, elapsed, "script" if rc == 0 else "script-already")
+                conc = CONC_DIR / f"{day}.md"
+                if not conc.exists():
+                    conc = save_script_conclusion(
+                        day, rc, text, elapsed,
+                        "成功" if rc == 0 else "当日此前已完成")
+                log(f"脚本通道完成：{day}（exit {rc}，{elapsed:.1f} 秒）｜结论见 {conc.name}")
+                notify("任务完成",
+                       f"{day} 脚本通道完成，用时 {elapsed:.1f} 秒。\n"
+                       f"结论：{CONC_DIR.name}/{conc.name}",
+                       sticky=True, open_path=CONC_DIR)
+                return
+
+            if rc is None:
+                n, wait = _mark_fail(day, why or "脚本未能启动")
+                save_script_conclusion(day, rc, text or why, elapsed, "脚本未能启动")
+                log(f"脚本通道无法启动：{day}｜{why}｜第 {n} 次失败，"
+                    f"{wait // 60} 分钟后重试")
+                notify("脚本通道异常",
+                       f"{day} 没能启动生成脚本。\n原因：{why}\n"
+                       f"第 {n} 次失败，约 {wait // 60} 分钟后自动重试。",
+                       sticky=True, open_path=slog)
+                return
+
+            if rc in (0, 4) and not has_produced(day):
+                why = f"脚本 exit {rc} 但目录里没有产物"
+                n, wait = _mark_fail(day, why)
+                save_script_conclusion(day, rc, text, elapsed, "脚本报完成但未产出")
+                log(f"脚本通道异常：{day}｜{why}｜第 {n} 次失败，"
+                    f"{wait // 60} 分钟后重试｜详见 {slog.name}")
+                notify("任务未产出",
+                       f"{day} 脚本报完成但目录里找不到产物。\n"
+                       f"第 {n} 次失败，约 {wait // 60} 分钟后自动重试。\n查看 {slog}",
+                       sticky=True, open_path=slog)
+                return
+
+            if rc == 5:
+                why = _last_line(text)
+                n, wait = _mark_fail(day, why)
+                save_script_conclusion(day, rc, text, elapsed, "缺件未执行")
+                log(f"脚本通道缺件：{day}｜{why}｜第 {n} 次，"
+                    f"{wait // 60} 分钟后重试｜详见 {slog.name}")
+                notify("缺件未执行",
+                       f"{day} 源件不齐，脚本按口径停下（不猜、不替代）。\n"
+                       f"{why}\n第 {n} 次，约 {wait // 60} 分钟后自动重试。",
+                       sticky=True, open_path=slog)
+                return
+
+            if rc == 3:
+                why = _last_line(text)
+                n, wait = _mark_fail(day, "自检不过：" + why)
+                save_script_conclusion(day, rc, text, elapsed, "自检不过（未落盘）")
+                log(f"脚本通道自检不过：{day}｜{why}｜第 {n} 次，"
+                    f"{wait // 60} 分钟后重试｜详见 {slog.name}")
+                notify("自检不过（未落盘）",
+                       f"{day} 生成结果没通过自检，已拦在暂存区，正式产物未被替换。\n"
+                       f"{why}\n完整自检结果见 {slog.name}。\n"
+                       f"第 {n} 次，约 {wait // 60} 分钟后自动重试。",
+                       sticky=True, open_path=slog)
+                return
+
+            # exit 2 口径不明：唯一需要判断的路径，交模型
+            log(f"脚本通道未通过（exit {rc}，{elapsed:.1f} 秒）：{_last_line(text)}"
+                f"｜转入模型兜底")
+
+        # ---------------------------------------------------------- 第二路：模型兜底
         log(f"开始执行：{day}｜输出 {out_log.name}")
         r = _run_cli_retry(build_prompt(day), out_log, CFG["run_timeout"],
                            f"执行 {day}", extra_args=_perm_args())
         elapsed = time.time() - t0
-        if r.returncode == 0:
-            done.write_text(json.dumps(
-                {"day": day, "at": datetime.now().isoformat(timespec="seconds"),
-                 "elapsed_seconds": round(elapsed, 1), "exit": 0},
-                ensure_ascii=False), encoding="utf-8")
+        if r.returncode == 0 and has_produced(day):
+            _finish_done(day, done, elapsed, "cli")
             log(f"执行完成：{day}（exit 0，耗时 {elapsed / 60:.1f} 分钟）")
             save_conclusion(day, r, elapsed, out_log)
             notify("任务完成", f"{day} 已执行，结论见 {CONC_DIR.name}/{day}.md",
                    sticky=True, open_path=CONC_DIR)
-        else:
-            log(f"执行失败：{day}（exit {r.returncode}）｜详见 {out_log.name}")
+        elif r.returncode == 0:
+            # 正常退出却没产物：绝不能写 done，否则 _day_action 按「已完成」跳过，
+            # 该日永久漏掉，等到周期末日重算才发现少一天的 sheet。
+            n, wait = _mark_fail(day, "模型正常退出但未产出")
+            log(f"执行未产出：{day}（exit 0，{elapsed / 60:.1f} 分钟），"
+                f"第 {n} 次失败，{wait // 60} 分钟后重试｜详见 {out_log.name}")
             save_conclusion(day, r, elapsed, out_log)
-            notify("任务失败", f"{day} exit {r.returncode}", sticky=True, open_path=out_log)
+            notify("任务未产出",
+                   f"{day} 命令正常退出但未生成产物。\n"
+                   f"第 {n} 次失败，约 {wait // 60} 分钟后自动重试。\n查看 {out_log}",
+                   sticky=True, open_path=out_log)
+        else:
+            n, wait = _mark_fail(day, f"exit {r.returncode}")
+            log(f"执行失败：{day}（exit {r.returncode}），第 {n} 次失败，"
+                f"{wait // 60} 分钟后重试｜详见 {out_log.name}")
+            save_conclusion(day, r, elapsed, out_log)
+            notify("任务失败", f"{day} exit {r.returncode}，第 {n} 次失败。\n"
+                            f"约 {wait // 60} 分钟后自动重试。",
+                   sticky=True, open_path=out_log)
     except Exception as e:
         log(f"执行异常：{day}｜{e}")
     finally:
         lock.unlink(missing_ok=True)
+
+
+def _finish_done(day: str, done: Path, elapsed: float, via: str):
+    """写完成标记并清掉失败计数。脚本路与模型路共用。"""
+    done.write_text(json.dumps({
+        "day": day,
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "elapsed_seconds": round(elapsed),
+        "exit": 0,
+        "via": via,
+    }, ensure_ascii=False), encoding="utf-8")
+    _clear_fail(day)
 
 
 def run_task_serial(day: str):
@@ -1563,6 +1893,8 @@ def main():
         while True:
             try:
                 _beat()
+                # 弹窗链路自检：写 <trigger>/_popup_probe.txt 即弹（第九版）
+                _check_popup_probe()
                 # 外部来源取件：文件先落在下载目录/聊天软件目录时，靠这一步认领
                 for c in ext:
                     if time.time() < ext_next[c["name"]]:
@@ -1620,10 +1952,20 @@ def main():
                             else:
                                 log(f"源文件齐备（{day}），标记 {rp.name}")
                             if CFG.get("auto_run"):
+                                # 退避闸：被记过失败的日子，没到重试时间就不入队（第八版）。
+                                # 这一步必须用落盘状态判断，不能用内存集合 —— 否则某日
+                                # 入队失败一次就永久卡死，日志却一直写「下一轮重试」。
+                                ok_run, attempt, last_err = _retry_gate(day)
+                                if not ok_run:
+                                    if attempt and last_err:
+                                        log(f"{day} 退避中（已试 {attempt} 次，"
+                                            f"上次：{last_err[:80]}）")
+                                    continue
                                 if enqueue_task(day, action):
                                     log(f"已入队：{day}"
                                         f"（{'整周期重算' if action == 'recalc' else '常规'}，"
-                                        f"队列待执行 {_RUN_QUEUE.qsize()}）")
+                                        f"队列待执行 {_RUN_QUEUE.qsize()}"
+                                        f"{'，第 ' + str(attempt) + ' 次' if attempt > 1 else ''}）")
                             else:
                                 notify("源文件已齐备",
                                        f"{day} 可执行任务（auto_run=false，需人工触发）")
