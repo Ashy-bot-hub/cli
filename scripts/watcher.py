@@ -235,7 +235,15 @@ def notify(title, text, sticky=False, open_path=None):
     log(f"[通知] {title}｜{text}")
     if sticky:
         if CFG.get("notify_sticky", True):
-            _sticky_box(title, text, open_path)
+            # 弹窗是「告知」不是「流程」：它自身出错不许打断调用方的任务主流程。
+            # 教训（2026-11-02）：某业务副本重构时把 _STICKY_LAST / _STICKY_GAP
+            # 两行常量删了、_sticky_box 函数体留着，于是每次弹结果框都抛
+            # NameError，被任务最外层的 except 吞成一行「自动执行异常」——
+            # 结果框从此永久哑火，而日志里完全看不出是弹窗的问题。
+            try:
+                _sticky_box(title, text, open_path)
+            except Exception as e:
+                log(f"结果框调用失败（不影响主流程）：{title}｜{e}")
         return
     if CFG.get("notify_sound"):
         try:
