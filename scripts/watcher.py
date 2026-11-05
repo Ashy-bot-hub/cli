@@ -393,9 +393,10 @@ def has_produced(day: str) -> bool:
         try:
             rel = os.path.relpath(p, root_s)
         except ValueError:
-            # 产物在别的盘：relpath 抛错，退回只看文件名。用整条绝对路径会让
-            # 上级目录里偶然同名的日期段参与匹配，把别的日子判成已产出。
-            rel = os.path.basename(p)
+            # 跨盘时 relpath 抛错。退回「去掉盘符的路径」而不是只留文件名：
+            # 日期放在目录名里时（F:/成本资料/2026.10.1/月报.xlsx），只留文件名
+            # 会让这条判定永远为假，于是每轮重复生成、任务永不收尾。
+            rel = os.path.splitdrive(p)[1]
         # 空文件当模板看：日期目录里放个空壳不该让这一天的产出判定为已完成。
         try:
             if os.path.getsize(p) == 0:
