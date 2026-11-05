@@ -397,9 +397,14 @@ def has_produced(day: str) -> bool:
             # 日期放在目录名里时（F:/成本资料/2026.10.1/月报.xlsx），只留文件名
             # 会让这条判定永远为假，于是每轮重复生成、任务永不收尾。
             rel = os.path.splitdrive(p)[1]
-        # 空文件当模板看：日期目录里放个空壳不该让这一天的产出判定为已完成。
+        # 空文件当模板看，但要有稳定窗口：产物正被别的进程写时，创建瞬间读到
+        # 0 字节会判成「未产出」，于是同日再起一次生成、两个进程写同一工作簿。
+        # 要求非空且 mtime 至少 5 秒前，避开写入中的窗口。
         try:
-            if os.path.getsize(p) == 0:
+            st = os.stat(p)
+            if st.st_size == 0:
+                continue
+            if time.time() - st.st_mtime < 5:
                 continue
         except OSError:
             continue
