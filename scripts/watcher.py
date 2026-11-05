@@ -385,8 +385,18 @@ def has_produced(day: str) -> bool:
         return bool(hits)
     # 通配符会把前缀撞号：报表10.1* 会命中 报表10.11.xlsx，导致 10-01 被判「已有产物」
     # 永久跳过。这里按日期再核一遍，日期后面紧跟数字的一律不算。
+    # 比对用相对产出根目录的整段路径而不是只比文件名：产物按日期分目录放的情况
+    # （2026.10.1/报表.xlsx）只看 basename 会判成没有产物，于是重复生成。
     rx = re.compile(rf"(?<!\d){y}\D{{1,2}}0?{m}\D{{1,2}}0?{d}(?!\d)")
-    return any(rx.search(os.path.basename(p)) for p in hits)
+    root_s = str(ROOT)
+    for p in hits:
+        try:
+            rel = os.path.relpath(p, root_s)
+        except ValueError:
+            rel = p
+        if rx.search(rel.replace(os.sep, "/")):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- 源文件解析
