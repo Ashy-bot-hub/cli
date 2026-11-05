@@ -393,7 +393,15 @@ def has_produced(day: str) -> bool:
         try:
             rel = os.path.relpath(p, root_s)
         except ValueError:
-            rel = p
+            # 产物在别的盘：relpath 抛错，退回只看文件名。用整条绝对路径会让
+            # 上级目录里偶然同名的日期段参与匹配，把别的日子判成已产出。
+            rel = os.path.basename(p)
+        # 空文件当模板看：日期目录里放个空壳不该让这一天的产出判定为已完成。
+        try:
+            if os.path.getsize(p) == 0:
+                continue
+        except OSError:
+            continue
         if rx.search(rel.replace(os.sep, "/")):
             return True
     return False
