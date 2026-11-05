@@ -380,7 +380,13 @@ def has_produced(day: str) -> bool:
     except Exception:
         return False
     base = pat if os.path.isabs(pat) else str(ROOT / pat)
-    return bool(glob.glob(base))
+    hits = glob.glob(base)
+    if not hits or "{" not in g:
+        return bool(hits)
+    # 通配符会把前缀撞号：报表10.1* 会命中 报表10.11.xlsx，导致 10-01 被判「已有产物」
+    # 永久跳过。这里按日期再核一遍，日期后面紧跟数字的一律不算。
+    rx = re.compile(rf"(?<!\d){y}\D{{1,2}}0?{m}\D{{1,2}}0?{d}(?!\d)")
+    return any(rx.search(os.path.basename(p)) for p in hits)
 
 
 # ---------------------------------------------------------------- 源文件解析
@@ -1423,6 +1429,12 @@ def run_task(day: str):
                    sticky=True, open_path=out_log)
     except Exception as e:
         log(f"执行异常：{day}｜{e}")
+        # 不落退避标记时，主循环会每轮重新入队同一日，永远重跑且不提示
+        try:
+            n, wait = _mark_fail(day, f"执行异常：{e}")
+            log(f"已记失败：第 {n} 次，{wait // 60} 分钟后重试")
+        except Exception:
+            pass
     finally:
         lock.unlink(missing_ok=True)
 
